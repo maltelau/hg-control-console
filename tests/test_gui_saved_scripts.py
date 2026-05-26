@@ -47,6 +47,7 @@ class FakeScriptManager:
                 "role": "Follower",
                 "distance_threshold": 1.0,
                 "formation_radius": 0.0,
+                "max_follow_distance": 300.0,
                 "bypass_no_walk": True,
             }
         if script_id == "auto_attack":
@@ -253,6 +254,7 @@ class GuiSavedScriptsTests(unittest.TestCase):
                         "role": "Lead",
                         "distance_threshold": 1.0,
                         "formation_radius": 0.0,
+                        "max_follow_distance": 300.0,
                         "bypass_no_walk": True,
                     },
                 ),
@@ -264,6 +266,7 @@ class GuiSavedScriptsTests(unittest.TestCase):
                         "role": "Follower",
                         "distance_threshold": 1.0,
                         "formation_radius": 0.0,
+                        "max_follow_distance": 300.0,
                         "bypass_no_walk": True,
                     },
                 ),

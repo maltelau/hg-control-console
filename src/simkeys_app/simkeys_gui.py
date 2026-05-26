@@ -141,7 +141,7 @@ SCRIPT_CARD_LAYOUTS = {
     "coordinate_follow": {
         "expanded": False,
         "sections": [
-            ("Follow", ["follow_interval_seconds", "distance_threshold", "formation_radius", "bypass_no_walk", "combat_grace_seconds"]),
+            ("Follow", ["follow_interval_seconds", "distance_threshold", "max_follow_distance", "formation_radius", "bypass_no_walk", "combat_grace_seconds"]),
         ],
         "advanced_title": "Debug / Advanced",
         "advanced": ["position_poll_interval", "lead_stale_seconds", "poll_interval", "max_lines", "echo_console", "include_backlog"],
@@ -938,6 +938,9 @@ class ScriptCard:
             lead_name = str(details.get("last_lead_name") or "").strip() or "<waiting>"
             lines.append(f"Lead: {lead_name} at {details.get('last_lead_position') or '<unknown>'}")
             lines.append(f"Move target: {details.get('last_target_position') or '<unknown>'}")
+            guard_reason = str(details.get("last_guard_reason") or "").strip()
+            if guard_reason:
+                lines.append(f"Guard: {guard_reason}")
             lines.append(f"Bypass active: {'Yes' if details.get('walk_bypass_active') else 'No'}")
         self.coordinate_runtime_var.set("\n".join(lines))
 
@@ -1288,6 +1291,8 @@ class SimKeysDesktopApp:
                 cleaned["distance_threshold"] = CoordinateFollowScript.DEFAULT_DISTANCE_THRESHOLD
             if "formation_radius" not in cleaned:
                 cleaned["formation_radius"] = CoordinateFollowScript.DEFAULT_FORMATION_RADIUS
+            if "max_follow_distance" not in cleaned:
+                cleaned["max_follow_distance"] = CoordinateFollowScript.DEFAULT_MAX_FOLLOW_DISTANCE
             if "bypass_no_walk" not in cleaned:
                 cleaned["bypass_no_walk"] = True
         return cleaned

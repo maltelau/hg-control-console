@@ -6242,6 +6242,7 @@ class CoordinateLeadSnapshot:
     y: float
     z: float
     updated_at: float
+    area_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -6253,6 +6254,7 @@ class CoordinateClientSnapshot:
     y: float
     z: float
     updated_at: float
+    area_id: Optional[str] = None
 
 
 class CoordinateFollowRegistry:
@@ -6261,7 +6263,13 @@ class CoordinateFollowRegistry:
         self.lead: Optional[CoordinateLeadSnapshot] = None
         self.clients: Dict[int, CoordinateClientSnapshot] = {}
 
-    def publish(self, pid: int, name: str, position: Tuple[float, float, float]) -> CoordinateLeadSnapshot:
+    def publish(
+        self,
+        pid: int,
+        name: str,
+        position: Tuple[float, float, float],
+        area_id: Optional[str] = None,
+    ) -> CoordinateLeadSnapshot:
         snapshot = CoordinateLeadSnapshot(
             pid=int(pid),
             name=str(name or "").strip(),
@@ -6269,16 +6277,31 @@ class CoordinateFollowRegistry:
             y=float(position[1]),
             z=float(position[2]),
             updated_at=time.monotonic(),
+            area_id=area_id,
         )
         with self.lock:
             self.lead = snapshot
-            self._publish_client_locked(snapshot.pid, snapshot.name, CoordinateFollowScript.ROLE_LEAD, position, snapshot.updated_at)
+            self._publish_client_locked(
+                snapshot.pid,
+                snapshot.name,
+                CoordinateFollowScript.ROLE_LEAD,
+                position,
+                snapshot.updated_at,
+                snapshot.area_id,
+            )
         return snapshot
 
-    def publish_client(self, pid: int, name: str, role: str, position: Tuple[float, float, float]) -> CoordinateClientSnapshot:
+    def publish_client(
+        self,
+        pid: int,
+        name: str,
+        role: str,
+        position: Tuple[float, float, float],
+        area_id: Optional[str] = None,
+    ) -> CoordinateClientSnapshot:
         now = time.monotonic()
         with self.lock:
-            return self._publish_client_locked(int(pid), name, role, position, now)
+            return self._publish_client_locked(int(pid), name, role, position, now, area_id)
 
     def _publish_client_locked(
         self,
@@ -6287,6 +6310,7 @@ class CoordinateFollowRegistry:
         role: str,
         position: Tuple[float, float, float],
         updated_at: float,
+        area_id: Optional[str],
     ) -> CoordinateClientSnapshot:
         snapshot = CoordinateClientSnapshot(
             pid=int(pid),
@@ -6296,6 +6320,7 @@ class CoordinateFollowRegistry:
             y=float(position[1]),
             z=float(position[2]),
             updated_at=float(updated_at),
+            area_id=area_id,
         )
         self.clients[snapshot.pid] = snapshot
         return snapshot
@@ -6319,7 +6344,11 @@ class CoordinateFollowRegistry:
             return None
         return lead
 
-    def followers(self, max_age_seconds: float = 3.0) -> Tuple[CoordinateClientSnapshot, ...]:
+    def followers(
+        self,
+        max_age_seconds: float = 3.0,
+        area_id: Optional[str] = None,
+    ) -> Tuple[CoordinateClientSnapshot, ...]:
         now = time.monotonic()
         with self.lock:
             lead_pid = self.lead.pid if self.lead is not None else None
@@ -6330,10 +6359,19 @@ class CoordinateFollowRegistry:
                 continue
             if max_age_seconds > 0 and now - snapshot.updated_at > max_age_seconds:
                 continue
+            if (
+                area_id is not None
+                and snapshot.area_id is not None
+                and self._area_key(snapshot.area_id) != self._area_key(area_id)
+            ):
+                continue
             if str(snapshot.role or "").strip().lower() == CoordinateFollowScript.ROLE_LEAD.lower():
                 continue
             recent.append(snapshot)
         return tuple(sorted(recent, key=lambda item: (item.name.lower(), item.pid)))
+
+    def _area_key(self, area_id: str) -> str:
+        return str(area_id or "").strip().casefold()
 
 
 _COORDINATE_FOLLOW_REGISTRY = CoordinateFollowRegistry()
@@ -6346,6 +6384,18 @@ class CoordinateFollowScript(ClientScriptBase):
     ROLE_LEAD = "Lead"
     DEFAULT_DISTANCE_THRESHOLD = 1.0
     DEFAULT_FORMATION_RADIUS = 0.0
+    DEFAULT_MAX_FOLLOW_DISTANCE = 300.0
+    AREA_TRANSITION_RE = re.compile(r"\bYou are now in\s+(.+?)(?:\.\s*)?$")
+    AREA_QUERY_KEYS = (
+        "area_id",
+        "area_object_id",
+        "area_object",
+        "current_area_id",
+        "current_area_object_id",
+        "current_area_object",
+        "map_id",
+        "map",
+    )
 
     def __init__(self, client, config: Dict[str, object], host):
         super().__init__(client, config, host)
@@ -6357,6 +6407,10 @@ class CoordinateFollowScript(ClientScriptBase):
         self.last_lead_name = ""
         self.last_lead_position: Optional[Tuple[float, float, float]] = None
         self.last_target_position: Optional[Tuple[float, float, float]] = None
+        self.last_area_id: Optional[str] = None
+        self.last_chat_area_id: Optional[str] = None
+        self.last_lead_area_id: Optional[str] = None
+        self.last_guard_reason = ""
         self.last_move_error_key = ""
         self.formation_retry = 0
         self.walk_bypass_active = False
@@ -6371,6 +6425,10 @@ class CoordinateFollowScript(ClientScriptBase):
         self.last_lead_name = ""
         self.last_lead_position = None
         self.last_target_position = None
+        self.last_area_id = None
+        self.last_chat_area_id = None
+        self.last_lead_area_id = None
+        self.last_guard_reason = ""
         self.last_move_error_key = ""
         self.formation_retry = 0
         self.walk_bypass_active = False
@@ -6389,14 +6447,15 @@ class CoordinateFollowScript(ClientScriptBase):
         super().on_stop()
 
     def needs_chat_feed(self) -> bool:
-        return not self._is_lead()
+        return True
 
     def chat_event_types(self) -> Tuple[str, ...]:
-        return ("attack", "damage")
+        return ("raw",)
 
     def on_chat_event(self, event: ChatLineEvent):
         if not self.should_process(event.sequence) or not self.enabled:
             return
+        self._observe_area_event(event.raw_text)
         self._observe_combat_event(event)
 
     def on_tick(self):
@@ -6421,9 +6480,12 @@ class CoordinateFollowScript(ClientScriptBase):
             self.client.pid,
             self.host.client.character_name or self.client.character_name or self.host.client.display_name,
             position,
+            self.last_area_id,
         )
         self.last_lead_name = snapshot.name
         self.last_lead_position = (snapshot.x, snapshot.y, snapshot.z)
+        self.last_lead_area_id = snapshot.area_id
+        self.last_guard_reason = ""
         self.set_status("Lead active")
 
     def _tick_timer_follow(self):
@@ -6446,14 +6508,37 @@ class CoordinateFollowScript(ClientScriptBase):
             return
 
         own_position = self._read_own_position()
-        if own_position is not None:
-            self._publish_own_position(own_position)
+        if own_position is None:
+            self.last_guard_reason = "Follower position unavailable"
+            self.set_status("Follower position unavailable")
+            return
+
+        self._publish_own_position(own_position)
+        self.last_lead_name = lead.name
+        self.last_lead_position = (lead.x, lead.y, lead.z)
+        self.last_lead_area_id = lead.area_id
+
+        if self._lead_area_mismatch(lead):
+            self.last_target_position = None
+            self.last_guard_reason = "Lead is on another map"
+            self.set_status("Lead on another map")
+            return
+
+        lead_position = (lead.x, lead.y, lead.z)
+        lead_distance = self._distance(own_position, lead_position)
+        max_follow_distance = self._max_follow_distance()
+        if max_follow_distance > 0 and lead_distance > max_follow_distance:
+            self.last_target_position = None
+            self.last_guard_reason = f"Lead too far ({lead_distance:.1f} > {max_follow_distance:.1f})"
+            self.set_status("Lead too far")
+            return
 
         target_position = self._target_position_for_lead(lead)
-        if own_position is not None and self._distance(own_position, target_position) <= self._distance_threshold():
+        if self._distance(own_position, target_position) <= self._distance_threshold():
             self.last_lead_name = lead.name
             self.last_lead_position = (lead.x, lead.y, lead.z)
             self.last_target_position = target_position
+            self.last_guard_reason = ""
             self.set_status(f"Near lead {lead.name or lead.pid}")
             return
 
@@ -6475,6 +6560,7 @@ class CoordinateFollowScript(ClientScriptBase):
         if success:
             self.move_count += 1
             self.last_move_error_key = ""
+            self.last_guard_reason = ""
             self.formation_retry = 0
             self.set_status(f"Moved near {lead.name or lead.pid} ({reason})")
             if bool(self.config.get("echo_console", False)):
@@ -6484,6 +6570,7 @@ class CoordinateFollowScript(ClientScriptBase):
 
         if self._is_nonfatal_move_rejection(result):
             self.last_move_error_key = ""
+            self.last_guard_reason = ""
             if self._formation_radius() > 0:
                 self.formation_retry += 1
             self.set_status(f"Move skipped near {lead.name or lead.pid}")
@@ -6546,8 +6633,10 @@ class CoordinateFollowScript(ClientScriptBase):
         except Exception as exc:
             error_key = f"query:{type(exc).__name__}:{exc}"
             self._report_move_error(error_key, f"position query failed: {exc}")
+            self.last_area_id = None
             return None
 
+        self.last_area_id = self._query_area_id(query) or self.last_chat_area_id
         if not query.get("position_valid"):
             return None
         position = query.get("position")
@@ -6565,13 +6654,14 @@ class CoordinateFollowScript(ClientScriptBase):
             self.host.client.character_name or self.client.character_name or self.host.client.display_name,
             self.ROLE_LEAD if self._is_lead() else self.ROLE_FOLLOWER,
             position,
+            self.last_area_id,
         )
 
     def _target_position_for_lead(self, lead: CoordinateLeadSnapshot) -> Tuple[float, float, float]:
         radius = self._formation_radius()
         if radius <= 0:
             return (lead.x, lead.y, lead.z)
-        slot_index, slot_count = self._formation_slot()
+        slot_index, slot_count = self._formation_slot(lead.area_id)
         angle = (math.tau * (slot_index % slot_count) / slot_count) + (self.formation_retry * math.pi / 4.0)
         return (
             lead.x + math.cos(angle) * radius,
@@ -6579,8 +6669,8 @@ class CoordinateFollowScript(ClientScriptBase):
             lead.z,
         )
 
-    def _formation_slot(self) -> Tuple[int, int]:
-        followers = list(_COORDINATE_FOLLOW_REGISTRY.followers(self._lead_stale_seconds()))
+    def _formation_slot(self, area_id: Optional[str] = None) -> Tuple[int, int]:
+        followers = list(_COORDINATE_FOLLOW_REGISTRY.followers(self._lead_stale_seconds(), area_id=area_id))
         self_pid = int(self.client.pid)
         if all(snapshot.pid != self_pid for snapshot in followers):
             followers.append(CoordinateClientSnapshot(
@@ -6591,6 +6681,7 @@ class CoordinateFollowScript(ClientScriptBase):
                 y=0.0,
                 z=0.0,
                 updated_at=time.monotonic(),
+                area_id=self.last_area_id,
             ))
             followers.sort(key=lambda item: (item.name.lower(), item.pid))
         slot_count = max(len(followers), 1)
@@ -6602,6 +6693,17 @@ class CoordinateFollowScript(ClientScriptBase):
     def _observe_combat_event(self, event: ChatLineEvent):
         if event.attack is not None or event.damage is not None:
             self.last_combat_at = time.monotonic()
+
+    def _observe_area_event(self, text: str):
+        normalized = hgx_combat.normalize_chat_line(str(text or "")).strip()
+        match = self.AREA_TRANSITION_RE.search(normalized)
+        if not match:
+            return
+        area_name = re.sub(r"\s+", " ", match.group(1)).strip(" .")
+        if area_name:
+            self.last_chat_area_id = f"area:{area_name}"
+            if self.last_area_id is None or str(self.last_area_id).startswith("area:"):
+                self.last_area_id = self.last_chat_area_id
 
     def _in_combat(self, now: Optional[float] = None) -> bool:
         now = time.monotonic() if now is None else float(now)
@@ -6625,6 +6727,9 @@ class CoordinateFollowScript(ClientScriptBase):
     def _bypass_no_walk(self) -> bool:
         return bool(self.config.get("bypass_no_walk", True))
 
+    def _max_follow_distance(self) -> float:
+        return max(float(self.config.get("max_follow_distance", self.DEFAULT_MAX_FOLLOW_DISTANCE)), 0.0)
+
     def _combat_grace_seconds(self) -> float:
         return max(float(self.config.get("combat_grace_seconds", 6.0)), 0.0)
 
@@ -6636,6 +6741,47 @@ class CoordinateFollowScript(ClientScriptBase):
         dy = float(left[1]) - float(right[1])
         dz = float(left[2]) - float(right[2])
         return (dx * dx + dy * dy + dz * dz) ** 0.5
+
+    def _lead_area_mismatch(self, lead: CoordinateLeadSnapshot) -> bool:
+        if self.last_area_id is None or lead.area_id is None:
+            return False
+        return self._area_key(self.last_area_id) != self._area_key(lead.area_id)
+
+    def _area_key(self, area_id: str) -> str:
+        return str(area_id or "").strip().casefold()
+
+    def _query_area_id(self, query: dict) -> Optional[str]:
+        for key in self.AREA_QUERY_KEYS:
+            if key not in query:
+                continue
+            normalized = self._normalize_area_id(query.get(key))
+            if normalized:
+                return normalized
+        return None
+
+    def _normalize_area_id(self, value) -> Optional[str]:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return self._normalize_numeric_area_id(int(text, 0))
+            except ValueError:
+                return text
+        try:
+            return self._normalize_numeric_area_id(int(value))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _normalize_numeric_area_id(self, value: int) -> Optional[str]:
+        parsed = int(value)
+        if parsed < 0:
+            parsed &= 0xFFFFFFFF
+        if parsed in (0, 0xFFFFFFFF, 0x7FFFFFFF):
+            return None
+        return f"0x{parsed & 0xFFFFFFFF:08X}"
 
     def _format_position(self, position: Optional[Tuple[float, float, float]]) -> str:
         if position is None:
@@ -6651,7 +6797,11 @@ class CoordinateFollowScript(ClientScriptBase):
             "last_lead_name": self.last_lead_name,
             "last_lead_position": self._format_position(self.last_lead_position),
             "last_target_position": self._format_position(self.last_target_position),
+            "current_area_id": self.last_area_id or "<unknown>",
+            "last_lead_area_id": self.last_lead_area_id or "<unknown>",
+            "last_guard_reason": self.last_guard_reason,
             "formation_radius": self._formation_radius(),
+            "max_follow_distance": self._max_follow_distance(),
             "bypass_no_walk": self._bypass_no_walk(),
             "walk_bypass_active": self.walk_bypass_active,
             "in_combat": self._in_combat(),
@@ -8667,6 +8817,20 @@ class ScriptManager:
                     step=0.1,
                     width=6,
                     help_text="How close the follower must be to its assigned destination before it stops issuing movement. Smaller values follow more tightly.",
+                ),
+                ScriptField(
+                    "max_follow_distance",
+                    "Max Dist",
+                    "float",
+                    CoordinateFollowScript.DEFAULT_MAX_FOLLOW_DISTANCE,
+                    minimum=0.0,
+                    maximum=10000.0,
+                    step=10.0,
+                    width=7,
+                    help_text=(
+                        "Safety cap measured from follower to lead. If the lead is farther away than this, the follower "
+                        "will not move; set 0 to disable this distance guard."
+                    ),
                 ),
                 ScriptField(
                     "formation_radius",
