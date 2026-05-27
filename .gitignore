@@ -35,6 +35,7 @@ data/character_defaults.user.json
 
 # Large reverse-engineering reference dumps stay local only.
 docs/reverse-engineering/decompiles/
+docs/reverse-engineering/notes/
 
 # Third-party/reference copies stay local only.
 Hgx.Client/
