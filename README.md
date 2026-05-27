@@ -194,13 +194,14 @@ The progress bar reports the counting, reading, merging, and classifying phases.
 
 ### Auto Action
 
-Auto Action repeatedly sends one selected HG action command on a cooldown:
+Auto Action repeatedly sends one selected HG action command on a cooldown while recent combat log lines show the selected character attacking or damaging a known `characters.d` target:
 
 - Called Shot: `!action cs opponent`
 - Knockdown: `!action kd opponent`
 - Disarm: `!action dis opponent`
+- Taunt: `!action attack+tau opponent`
 
-It does not need combat-log parsing.
+The active-combat window is at least 6 seconds and extends to the configured cooldown when that cooldown is longer.
 
 ### Auto Attack
 

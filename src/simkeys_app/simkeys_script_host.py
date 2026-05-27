@@ -5871,6 +5871,7 @@ class AutoAAScript(ClientScriptBase):
 
 class AutoActionScript(ClientScriptBase):
     script_id = "auto_action"
+    COMBAT_WINDOW_SECONDS = 6.0
     MODE_CONFIG = {
         "Called Shot": ("!action cs opponent", "Called Shot"),
         "Knockdown": ("!action kd opponent", "Knockdown"),
@@ -5879,7 +5880,6 @@ class AutoActionScript(ClientScriptBase):
     }
 
     MODE_CHOICES = tuple(MODE_CONFIG.keys())
-
 
     def __init__(self, client, config: Dict[str, object], host):
         super().__init__(client, config, host)
@@ -5913,9 +5913,6 @@ class AutoActionScript(ClientScriptBase):
             if self.db.lookup(defender) is not None:
                 self.last_combat_at = time.monotonic()
 
-    def on_chat_line(self, sequence: int, text: str):
-        pass
-
     def on_start(self):
         super().on_start()
         self.enabled = True
@@ -5946,7 +5943,7 @@ class AutoActionScript(ClientScriptBase):
     def _run_loop(self):
         while not self.loop_stop.is_set():
             now = time.monotonic()
-            if now - self.last_combat_at > self._cooldown_seconds():
+            if not self._combat_is_recent(now):
                 self.set_status("Waiting for combat")
                 if self.loop_stop.wait(0.50):
                     break
@@ -6006,6 +6003,15 @@ class AutoActionScript(ClientScriptBase):
 
     def _cooldown_seconds(self) -> float:
         return max(float(self.config.get("cooldown_seconds", 6.2)), 0.1)
+
+    def _combat_window_seconds(self) -> float:
+        return max(self.COMBAT_WINDOW_SECONDS, self._cooldown_seconds())
+
+    def _combat_is_recent(self, now: Optional[float] = None) -> bool:
+        if self.last_combat_at <= 0:
+            return False
+        current = time.monotonic() if now is None else float(now)
+        return current - self.last_combat_at <= self._combat_window_seconds()
 
 
 class AutoAttackScript(ClientScriptBase):
@@ -8781,8 +8787,8 @@ class ScriptManager:
             factory=AutoActionScript,
             details=(
                 "Auto Action repeatedly sends one selected HG action command against the current opponent on a fixed "
-                "cooldown. It is a lightweight helper for abilities like Called Shot, Knockdown, Disarm or Taunt and does not "
-                "need combat-log parsing to run."
+                "cooldown while recent outgoing attack or damage lines show active combat with a known characters.d target. "
+                "It is a lightweight helper for abilities like Called Shot, Knockdown, Disarm, or Taunt."
             ),
         )
         self.registry[auto_action.script_id] = auto_action
