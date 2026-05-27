@@ -31,6 +31,7 @@ _kernel32.ReadProcessMemory.restype = W.BOOL
 
 kLegacyImageBase = 0x00400000
 kLegacyHpPointerOffset = 0x0053165C
+kLegacyClientDefensiveCastingModeOffset = 0x184
 kLegacyHpOwnerOffset = 0x2B8
 kLegacyCurrentHpOffset = 0x4C
 kLegacyMaxHpProbeOffsets = (2, 4, 6, 8, 0xA, 0xC, 0xE, 0x10)
@@ -6956,6 +6957,8 @@ class AutoCombatModeScript(ClientScriptBase):
     MODE_IMPROVED_EXPERTISE = "Improved Expertise"
     MODE_POWER_ATTACK = "Power Attack"
     MODE_IMPROVED_POWER_ATTACK = "Improved Power Attack"
+    MODE_DEFENSIVE_CASTING = "Defensive Casting"
+    MODE_DEFENSIVE_CASTING_ACTION_ID = 10
     MODE_CONFIG = {
         MODE_RAPID_SHOT: ("!action rsm self", "memory"),
         MODE_FLURRY_OF_BLOWS: ("!action fbm self", "combat log"),
@@ -6963,6 +6966,7 @@ class AutoCombatModeScript(ClientScriptBase):
         MODE_IMPROVED_EXPERTISE: ("!action iem self", "combat log"),
         MODE_POWER_ATTACK: ("!action pam self", "combat log"),
         MODE_IMPROVED_POWER_ATTACK: ("!action ipm self", "combat log"),
+        MODE_DEFENSIVE_CASTING: ("Input_ToggleMode(10)", "memory"),
     }
     MODE_CHOICES = tuple(MODE_CONFIG.keys())
 
@@ -6971,6 +6975,10 @@ class AutoCombatModeScript(ClientScriptBase):
         self.enabled = False
         self.process_handle = None
         self.rsm_address = 0
+        self.defensive_casting_address = 0
+        self.defensive_casting_player_object = 0
+        self.defensive_casting_creature = 0
+        self.defensive_casting_shadow_active = False
         self.cooldown_until = 0.0
         self.identity_wait_logged = False
         self.last_probe_error = ""
@@ -6982,6 +6990,10 @@ class AutoCombatModeScript(ClientScriptBase):
         super().on_start()
         self.enabled = True
         self.rsm_address = 0
+        self.defensive_casting_address = 0
+        self.defensive_casting_player_object = 0
+        self.defensive_casting_creature = 0
+        self.defensive_casting_shadow_active = False
         self.cooldown_until = 0.0
         self.identity_wait_logged = False
         self.last_probe_error = ""
@@ -6992,6 +7004,12 @@ class AutoCombatModeScript(ClientScriptBase):
         if mode == self.MODE_RAPID_SHOT:
             try:
                 address = self._resolve_rsm_address()
+                self.set_status(f"{mode} armed 0x{address:08X}")
+            except Exception:
+                self.set_status(f"{mode} armed (probe pending)")
+        elif mode == self.MODE_DEFENSIVE_CASTING:
+            try:
+                address = self._resolve_defensive_casting_address()
                 self.set_status(f"{mode} armed 0x{address:08X}")
             except Exception:
                 self.set_status(f"{mode} armed (probe pending)")
@@ -7009,25 +7027,78 @@ class AutoCombatModeScript(ClientScriptBase):
         self._close_process_handle()
         self.host.emit("info", f"{self.host.client.display_name}: Auto Combat Mode stopped", script_id=self.script_id)
 
+    def on_tick(self):
+        if not self.enabled or self._mode_label() != self.MODE_DEFENSIVE_CASTING:
+            return
+
+        now = time.monotonic()
+        if now < self.cooldown_until:
+            return
+        if self._mode_is_active(self.MODE_DEFENSIVE_CASTING, None):
+            return
+
+        self._trigger_mode(self.MODE_DEFENSIVE_CASTING, "upkeep", now)
+
+    def needs_chat_feed(self) -> bool:
+        return self._mode_label() != self.MODE_DEFENSIVE_CASTING
+
     def chat_event_types(self) -> Tuple[str, ...]:
-        return ("attack",)
+        return ("attack", "damage")
 
     def on_chat_event(self, event: ChatLineEvent):
         if not self.should_process(event.sequence) or not self.enabled:
             return
-        attack = event.attack
-        if attack is None:
+
+        mode = self._mode_label()
+        if mode == self.MODE_DEFENSIVE_CASTING:
+            defender = self._observed_combat_label_from_event(event)
+            if defender:
+                self._handle_observed_combat_event(defender)
             return
-        self._handle_attack_event(attack)
+
+        if event.attack is not None:
+            self._handle_attack_event(event.attack)
 
     def on_chat_line(self, sequence: int, text: str):
         if not self.should_process(sequence) or not self.enabled:
             return
 
+        mode = self._mode_label()
         attack = hgx_combat.parse_attack_line(text)
-        if attack is None:
+        if attack is not None:
+            if mode == self.MODE_DEFENSIVE_CASTING:
+                self._handle_observed_combat_event(attack.defender)
+            else:
+                self._handle_attack_event(attack)
             return
-        self._handle_attack_event(attack)
+
+        if mode == self.MODE_DEFENSIVE_CASTING:
+            damage = hgx_combat.parse_damage_line(text)
+            if damage is not None:
+                self._handle_observed_combat_event(damage.defender)
+                return
+            defender = self._loose_observed_combat_label(text)
+            if defender:
+                self._handle_observed_combat_event(defender)
+
+    def _observed_combat_label_from_event(self, event: ChatLineEvent) -> str:
+        if event.attack is not None:
+            return str(getattr(event.attack, "defender", "") or "observed combat")
+        if event.damage is not None:
+            return str(getattr(event.damage, "defender", "") or "observed combat")
+        return self._loose_observed_combat_label(event.raw_text)
+
+    def _loose_observed_combat_label(self, text: str) -> str:
+        normalized = hgx_combat.normalize_chat_line(text)
+        lowered = normalized.lower()
+        for marker in (" attacks ", " damages "):
+            marker_at = lowered.find(marker)
+            if marker_at < 0:
+                continue
+            tail = normalized[marker_at + len(marker):].strip()
+            defender = hgx_combat.normalize_actor_name(tail.split(":", 1)[0])
+            return defender or "observed combat"
+        return ""
 
     def _handle_attack_event(self, attack):
         character_name = self._character_name()
@@ -7051,41 +7122,66 @@ class AutoCombatModeScript(ClientScriptBase):
             return
 
         mode = self._mode_label()
-        command = self._mode_command()
         if self._mode_is_active(mode, attack):
             return
 
+        self._trigger_mode(mode, attack.defender, now)
+
+    def _handle_observed_combat_event(self, defender: str = ""):
+        now = time.monotonic()
+        if now < self.cooldown_until:
+            return
+
+        mode = self._mode_label()
+        if mode != self.MODE_DEFENSIVE_CASTING:
+            return
+        if self._mode_is_active(mode, None):
+            return
+
+        self._trigger_mode(mode, defender or "observed combat", now)
+
+    def _trigger_mode(self, mode: str, defender: str, now: float):
+        command = self._mode_command()
         try:
-            result = self.host.send_chat(command, 2)
+            if mode == self.MODE_DEFENSIVE_CASTING:
+                result = self.host.set_action_mode(self.MODE_DEFENSIVE_CASTING_ACTION_ID, True)
+            else:
+                result = self.host.send_chat(command, 2)
         except Exception as exc:
             self.set_status("Trigger failed")
+            trigger_path = "action-mode trigger" if mode == self.MODE_DEFENSIVE_CASTING else "chat send"
             self.host.emit(
                 "error",
-                f"{self.host.client.display_name}: Auto Combat Mode {mode} chat send failed: {exc}",
+                f"{self.host.client.display_name}: Auto Combat Mode {mode} {trigger_path} failed: {exc}",
                 script_id=self.script_id,
             )
-            self.cooldown_until = now + 1.0
+            self.cooldown_until = now + self._cooldown_seconds()
             return
 
         self.cooldown_until = now + self._cooldown_seconds()
-        self.last_defender = attack.defender
+        self.last_defender = defender
         self.trigger_count += 1
         if result["success"]:
+            if mode == self.MODE_DEFENSIVE_CASTING:
+                self.defensive_casting_shadow_active = True
             self.set_status(f"{mode} triggered")
         else:
             self.set_status("Trigger failed")
 
+        active_text = ""
+        if "active" in result:
+            active_text = " active=unknown" if int(result["active"]) < 0 else f" active={result['active']}"
         self.host.emit(
             "info",
             (
-                f"{self.host.client.display_name}: Auto Combat Mode triggered {mode} on '{attack.defender}' "
-                f"command={command} success={result['success']} rc={result['rc']} err={result['err']}"
+                f"{self.host.client.display_name}: Auto Combat Mode triggered {mode} on '{defender}' "
+                f"command={command} success={result['success']}{active_text} rc={result['rc']} err={result['err']}"
             ),
             script_id=self.script_id,
         )
         if bool(self.config.get("echo_console", False)):
             self.host.send_console(
-                f"HGCC Auto Combat Mode {mode} -> {command} rc={result['rc']} err={result['err']}"
+                f"HGCC Auto Combat Mode {mode} -> {command}{active_text} rc={result['rc']} err={result['err']}"
             )
 
     def _mode_label(self) -> str:
@@ -7125,6 +7221,64 @@ class AutoCombatModeScript(ClientScriptBase):
                 self.set_status(f"{mode} active ({rsm_status})")
                 return True
             return False
+
+        if mode == self.MODE_DEFENSIVE_CASTING:
+            try:
+                status = self._read_defensive_casting_status()
+            except Exception as exc:
+                error_text = str(exc)
+                shadow_in_cooldown = self.defensive_casting_shadow_active and time.monotonic() < self.cooldown_until
+                self.set_status(f"{mode} active (probe pending)" if shadow_in_cooldown else "Probe pending")
+                if error_text != self.last_probe_error:
+                    self.last_probe_error = error_text
+                    self.host.emit(
+                        "error",
+                        f"{self.host.client.display_name}: Auto Combat Mode Defensive Casting memory probe failed: {error_text}",
+                        script_id=self.script_id,
+                    )
+                return shadow_in_cooldown
+
+            if status not in (0, 1):
+                error_text = (
+                    f"unexpected Defensive Casting status {status} at 0x{self.defensive_casting_address:08X} "
+                    f"player=0x{self.defensive_casting_player_object:08X} "
+                    f"clientCreature=0x{self.defensive_casting_creature:08X}"
+                )
+                self.defensive_casting_address = 0
+                self.defensive_casting_player_object = 0
+                self.defensive_casting_creature = 0
+                try:
+                    status = self._read_defensive_casting_status()
+                except Exception:
+                    status = -1
+                if status not in (0, 1):
+                    self.set_status("Probe invalid")
+                    self.defensive_casting_shadow_active = False
+                    if error_text != self.last_probe_error:
+                        self.last_probe_error = error_text
+                        self.host.emit(
+                            "error",
+                            f"{self.host.client.display_name}: Auto Combat Mode Defensive Casting memory probe invalid: {error_text}",
+                            script_id=self.script_id,
+                        )
+                    return False
+
+            if self.last_probe_error:
+                self.host.emit(
+                    "info",
+                    f"{self.host.client.display_name}: Auto Combat Mode Defensive Casting memory probe recovered",
+                    script_id=self.script_id,
+                )
+                self.last_probe_error = ""
+
+            self.defensive_casting_shadow_active = bool(status)
+            if status != 0:
+                self.set_status(f"{mode} active ({status})")
+                return True
+            return False
+
+        if attack is None:
+            return True
 
         active_modes = hgx_combat.parse_attack_mode_names(attack.attack_mode)
         self.last_active_modes = active_modes
@@ -7170,11 +7324,7 @@ class AutoCombatModeScript(ClientScriptBase):
         if self.rsm_address:
             return self.rsm_address
 
-        module_base = int((self.client.query or {}).get("module_base", 0)) or kLegacyImageBase
-        pointer_holder_address = module_base + kLegacyHpPointerOffset
-        pointer_holder = self._read_u32(pointer_holder_address)
-        if pointer_holder == 0:
-            raise RuntimeError(f"RSM pointer at 0x{pointer_holder_address:08X} was null")
+        module_base, pointer_holder_address, pointer_holder = self._resolve_legacy_player_pointer("RSM")
 
         self.rsm_address = pointer_holder + 0x188
         self.host.emit(
@@ -7191,6 +7341,47 @@ class AutoCombatModeScript(ClientScriptBase):
     def _read_rsm_status(self) -> int:
         return self._read_u8(self._resolve_rsm_address())
 
+    def _resolve_defensive_casting_address(self) -> int:
+        if self.defensive_casting_address:
+            return self.defensive_casting_address
+
+        module_base = 0
+        pointer_source = "identity"
+        try:
+            state = self.host.query_state()
+        except Exception:
+            state = {}
+        player_object = int(state.get("player_object", 0) or 0)
+        if player_object == 0:
+            module_base, pointer_holder_address, player_object = self._resolve_legacy_player_pointer("Defensive Casting")
+            pointer_source = f"legacy=0x{pointer_holder_address:08X}"
+
+        module_base = int(module_base or state.get("module_base", 0) or (self.client.query or {}).get("module_base", 0) or kLegacyImageBase)
+        self.defensive_casting_player_object = player_object
+        self.defensive_casting_creature = player_object
+        self.defensive_casting_address = player_object + kLegacyClientDefensiveCastingModeOffset
+        self.host.emit(
+            "info",
+            (
+                f"{self.client.display_name}: Defensive Casting path resolved module=0x{module_base:08X} "
+                f"source={pointer_source} clientCreature=0x{player_object:08X} "
+                f"state=0x{self.defensive_casting_address:08X}"
+            ),
+            script_id=self.script_id,
+        )
+        return self.defensive_casting_address
+
+    def _read_defensive_casting_status(self) -> int:
+        return self._read_u32(self._resolve_defensive_casting_address())
+
+    def _resolve_legacy_player_pointer(self, label: str) -> Tuple[int, int, int]:
+        module_base = int((self.client.query or {}).get("module_base", 0)) or kLegacyImageBase
+        pointer_holder_address = module_base + kLegacyHpPointerOffset
+        pointer_holder = self._read_u32(pointer_holder_address)
+        if pointer_holder == 0:
+            raise RuntimeError(f"{label} pointer at 0x{pointer_holder_address:08X} was null")
+        return module_base, pointer_holder_address, pointer_holder
+
     def _cooldown_seconds(self) -> float:
         return max(float(self.config.get("cooldown_seconds", 6.0)), 0.1)
 
@@ -7200,6 +7391,11 @@ class AutoCombatModeScript(ClientScriptBase):
             "trigger_count": self.trigger_count,
             "last_defender": self.last_defender,
             "last_active_modes": self.last_active_modes,
+            "rsm_address": self.rsm_address,
+            "defensive_casting_address": self.defensive_casting_address,
+            "defensive_casting_player_object": self.defensive_casting_player_object,
+            "defensive_casting_creature": self.defensive_casting_creature,
+            "defensive_casting_shadow_active": self.defensive_casting_shadow_active,
         }
 
 
@@ -8357,6 +8553,12 @@ class ClientScriptHost:
     def set_walk_bypass(self, enabled: bool):
         return runtime.set_walk_bypass(self.client, enabled)
 
+    def set_action_mode(self, mode: int, enabled: bool = True):
+        return runtime.set_action_mode(self.client, mode, enabled)
+
+    def set_combat_mode(self, mode: int, enabled: bool = True):
+        return self.set_action_mode(mode, enabled)
+
     def show_overlay_text(
         self,
         text: str,
@@ -8941,8 +9143,8 @@ class ScriptManager:
             script_id="auto_rsm",
             name="Auto Combat Mode",
             description=(
-                "Keep one selected combat mode active while attacking. Rapid Shot uses the RSM memory byte; "
-                "the other modes read active mode prefixes from combat log attack lines."
+                "Keep one selected combat mode active. Rapid Shot uses NWN memory, Defensive Casting reads the client mode flag, "
+                "and the other modes read active mode prefixes from combat log attack lines."
             ),
             fields=[
                 ScriptField(
@@ -8961,9 +9163,10 @@ class ScriptManager:
             ],
             factory=AutoCombatModeScript,
             details=(
-                "Auto Combat Mode keeps a chosen attack mode turned on while the character is actively fighting. Rapid "
-                "Shot is tracked through NWN memory, while the other supported modes are inferred from outgoing attack "
-                "lines and retried after the configured cooldown whenever the mode drops."
+                "Auto Combat Mode keeps a chosen mode turned on while fighting. Rapid Shot and Defensive Casting are "
+                "tracked through NWN memory; Defensive Casting is triggered through the client input function "
+                "on an upkeep cooldown when it reads as off. The other supported modes are inferred "
+                "from outgoing attack lines and retried after the configured cooldown whenever the mode drops."
             ),
         )
         self.registry[auto_rsm.script_id] = auto_rsm

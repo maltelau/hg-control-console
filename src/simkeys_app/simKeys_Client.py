@@ -11,6 +11,7 @@
 #   chat-poll    -> fetch captured chat/log lines from the hook ring buffer
 #   overlay-text -> render a small text overlay inside the game frame
 #   move-to-location X Y Z -> call the in-game move-to-position function directly
+#   set-action-mode M -> call the in-game SetMode/action-mode path directly
 
 import argparse, struct, time
 import ctypes as C
@@ -131,14 +132,17 @@ class Pipe:
         except Exception:
             pass
 
-OP_QUERY=3000; OP_SLOT=3001; OP_VK=3002; OP_SETLOG=3003; OP_REPLAY=3004; OP_SNAPSHOT=3005; OP_CHAT_SEND=3006; OP_CHAT_POLL=3007; OP_SLOT_PAGE=3008; OP_OVERLAY_TEXT=3009; OP_OVERLAY_CLEAR=3010; OP_OVERLAY_CLEAR_ALL=3011; OP_MOVE_TO_LOCATION=3012; OP_SET_WALK_BYPASS=3013
+OP_QUERY=3000; OP_SLOT=3001; OP_VK=3002; OP_SETLOG=3003; OP_REPLAY=3004; OP_SNAPSHOT=3005; OP_CHAT_SEND=3006; OP_CHAT_POLL=3007; OP_SLOT_PAGE=3008; OP_OVERLAY_TEXT=3009; OP_OVERLAY_CLEAR=3010; OP_OVERLAY_CLEAR_ALL=3011; OP_MOVE_TO_LOCATION=3012; OP_SET_WALK_BYPASS=3013; OP_SET_ACTION_MODE=3014
 QUERY_STRUCT_LEGACY = struct.Struct("<" + ("I" * 24) + ("i" * 10) + "I" + ("i" * 2) + ("I" * 4) + f"{CHAR_NAME_CAPACITY}s")
 QUERY_STRUCT = struct.Struct("<" + ("I" * 24) + ("i" * 10) + "I" + ("i" * 2) + ("I" * 4) + "ifff" + f"{CHAR_NAME_CAPACITY}s")
+QUERY_STRUCT_WITH_CREATURE = struct.Struct("<" + ("I" * 24) + ("i" * 10) + ("I" * 2) + ("i" * 2) + ("I" * 4) + "ifff" + f"{CHAR_NAME_CAPACITY}s")
 OVERLAY_TEXT_HEADER = struct.Struct("<iiiiiIi")
 OVERLAY_RESPONSE = struct.Struct("<iiii")
 MOVE_TO_LOCATION_REQUEST = struct.Struct("<fffiIi")
 MOVE_TO_LOCATION_RESPONSE = struct.Struct("<iiifff")
 WALK_BYPASS_RESPONSE = struct.Struct("<iii")
+SET_ACTION_MODE_REQUEST = struct.Struct("<ii")
+SET_ACTION_MODE_RESPONSE = struct.Struct("<iiiiii")
 OVERLAY_POSITIONS = {
     "ABSOLUTE": 0,
     "A": 0,
@@ -210,21 +214,24 @@ def format_quickbar_slots(mask):
 
 def query_state(p):
     _, data = p.xfer(OP_QUERY)
-    if len(data) == QUERY_STRUCT.size:
+    if len(data) == QUERY_STRUCT_WITH_CREATURE.size:
+        unpacked = QUERY_STRUCT_WITH_CREATURE.unpack(data)
+    elif len(data) == QUERY_STRUCT.size:
         unpacked = QUERY_STRUCT.unpack(data)
+        unpacked = unpacked[:35] + (0,) + unpacked[35:]
     elif len(data) == QUERY_STRUCT_LEGACY.size:
         legacy = QUERY_STRUCT_LEGACY.unpack(data)
-        unpacked = legacy[:-1] + (0, 0.0, 0.0, 0.0, legacy[-1])
+        unpacked = legacy[:35] + (0,) + legacy[35:-1] + (0, 0.0, 0.0, 0.0, legacy[-1])
     else:
         raise RuntimeError(
-            f"unexpected query payload size: got {len(data)}, expected {QUERY_STRUCT.size}"
+            f"unexpected query payload size: got {len(data)}, expected {QUERY_STRUCT_WITH_CREATURE.size}"
         )
     (module_base, hook_proc, hwnd, current_proc, original_proc, main_tid, installed,
      expected_wndproc, expected_pre_dispatch, expected_dispatch_thunk, expected_dispatch_slot0,
      app_global_slot, app_holder, app_object, app_inner, dispatcher_ptr, gate90, gate94, gate98,
      quickbar_exec, quickbar_slot_dispatch, quickbar_panel_vtable, quickbar_slot_ptr, quickbar_this,
      quickbar_page, quickbar_slot, quickbar_slot_type, quickbar_calls, quickbar_scan_attempts, quickbar_scan_hits,
-     last_vk, last_rc, last_error, log_level, player_object, identity_refresh_count, identity_error,
+     last_vk, last_rc, last_error, log_level, player_object, player_creature, identity_refresh_count, identity_error,
      quickbar_item_mask_low, quickbar_item_mask_high, quickbar_equipped_mask_low, quickbar_equipped_mask_high,
      position_valid, position_x, position_y, position_z,
      character_name_raw) = unpacked
@@ -256,6 +263,7 @@ def query_state(p):
         "quickbar_slot_ptr": quickbar_slot_ptr,
         "quickbar_this": quickbar_this,
         "player_object": player_object,
+        "player_creature": player_creature,
         "quickbar_page": quickbar_page,
         "quickbar_slot": quickbar_slot,
         "quickbar_slot_type": quickbar_slot_type,
@@ -293,7 +301,7 @@ def cmd_query(p):
     print(f"quickbar: exec={phex(result['quickbar_exec'])} slotDispatch={phex(result['quickbar_slot_dispatch'])} panelVtable={phex(result['quickbar_panel_vtable'])} capturedThis={phex(result['quickbar_this'])} page={result['quickbar_page']} slot={result['quickbar_slot']} slotPtr={phex(result['quickbar_slot_ptr'])} slotType={result['quickbar_slot_type']} calls={result['quickbar_calls']} scanAttempts={result['quickbar_scan_attempts']} scanHits={result['quickbar_scan_hits']} itemMask=0x{result['quickbar_item_mask']:09X} equippedMask=0x{result['quickbar_equipped_mask']:09X} equipped={equipped_slots}")
     position = result.get("position")
     position_text = f" pos=({position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f})" if position else " pos=<unknown>"
-    print(f"identity: player={phex(result['player_object'])} name={result['character_name'] or '<unknown>'} refreshes={result['identity_refresh_count']} err={result['identity_error']}{position_text}")
+    print(f"identity: player={phex(result['player_object'])} creature={phex(result['player_creature'])} name={result['character_name'] or '<unknown>'} refreshes={result['identity_refresh_count']} err={result['identity_error']}{position_text}")
     print(f"last: vk={phex(result['last_vk'])} rc={result['last_rc']} err={result['last_error']}")
     print()
     cmd_snapshot(p)
@@ -367,6 +375,22 @@ def set_walk_bypass(p, enabled):
         "enabled": bool(active),
         "err": err,
     }
+
+def set_action_mode(p, mode, enabled=True):
+    payload = SET_ACTION_MODE_REQUEST.pack(int(mode), 1 if enabled else 0)
+    _, data = p.xfer(OP_SET_ACTION_MODE, payload)
+    success, actual_mode, actual_enabled, active, rc, err = SET_ACTION_MODE_RESPONSE.unpack(data)
+    return {
+        "success": success,
+        "mode": actual_mode,
+        "enabled": bool(actual_enabled),
+        "active": active,
+        "rc": rc,
+        "err": err,
+    }
+
+def set_combat_mode(p, mode, enabled=True):
+    return set_action_mode(p, mode, enabled)
 
 def chat_poll(p, after=0, max_lines=20):
     _, data = p.xfer(OP_CHAT_POLL, struct.pack("ii", after, max_lines))
@@ -460,6 +484,17 @@ def cmd_set_walk_bypass(p, enabled):
     result = set_walk_bypass(p, bool(enabled))
     print(f"set-walk-bypass: success={result['success']} enabled={int(result['enabled'])} err={result['err']}")
 
+def cmd_set_action_mode(p, mode, enabled):
+    result = set_action_mode(p, int(mode), bool(enabled))
+    print(
+        "set-action-mode: "
+        f"success={result['success']} mode={result['mode']} enabled={int(result['enabled'])} "
+        f"active={result['active']} rc={result['rc']} err={result['err']}"
+    )
+
+def cmd_set_combat_mode(p, mode, enabled):
+    cmd_set_action_mode(p, mode, enabled)
+
 def cmd_chat_poll(p, after, max_lines):
     result = chat_poll(p, after, max_lines)
     print(f"chat-poll: latest_seq={result['latest_seq']} count={len(result['lines'])}")
@@ -505,6 +540,8 @@ if __name__ == "__main__":
     sub.add_parser("overlay-clear-all")
     s9 = sub.add_parser("move-to-location"); s9.add_argument("x", type=float); s9.add_argument("y", type=float); s9.add_argument("z", type=float); s9.add_argument("--client-side", type=int, choices=[0, 1], default=1); s9.add_argument("--action-object-id", default="0x7F000000"); s9.add_argument("--bypass-no-walk", action="store_true")
     s10 = sub.add_parser("set-walk-bypass"); s10.add_argument("enabled", type=int, choices=[0, 1])
+    s11 = sub.add_parser("set-action-mode"); s11.add_argument("mode", type=int, choices=range(0, 13)); s11.add_argument("--off", action="store_true")
+    s12 = sub.add_parser("set-combat-mode"); s12.add_argument("mode", type=int, choices=range(0, 13)); s12.add_argument("--off", action="store_true")
     a = ap.parse_args()
 
     p = Pipe(a.pid)
@@ -523,5 +560,7 @@ if __name__ == "__main__":
         elif a.cmd == "overlay-clear-all": cmd_overlay_clear_all(p)
         elif a.cmd == "move-to-location": cmd_move_to_location(p, a.x, a.y, a.z, a.client_side, a.action_object_id, a.bypass_no_walk)
         elif a.cmd == "set-walk-bypass": cmd_set_walk_bypass(p, a.enabled)
+        elif a.cmd == "set-action-mode": cmd_set_action_mode(p, a.mode, not a.off)
+        elif a.cmd == "set-combat-mode": cmd_set_combat_mode(p, a.mode, not a.off)
     finally:
         p.close()

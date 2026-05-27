@@ -594,6 +594,18 @@ def set_walk_bypass(record_or_pid, enabled: bool):
         pipe.close()
 
 
+def set_action_mode(record_or_pid, mode: int, enabled: bool = True):
+    pipe = open_pipe(record_or_pid)
+    try:
+        return simkeys.set_action_mode(pipe, mode, enabled)
+    finally:
+        pipe.close()
+
+
+def set_combat_mode(record_or_pid, mode: int, enabled: bool = True):
+    return set_action_mode(record_or_pid, mode, enabled)
+
+
 def show_overlay_text(
     record_or_pid,
     text: str,

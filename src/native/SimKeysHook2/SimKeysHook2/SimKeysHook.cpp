@@ -30,6 +30,7 @@ constexpr UINT kOpOverlayClear = 3010;
 constexpr UINT kOpOverlayClearAll = 3011;
 constexpr UINT kOpMoveToLocation = 3012;
 constexpr UINT kOpSetWalkBypass = 3013;
+constexpr UINT kOpSetActionMode = 3014;
 
 constexpr UINT kMsgTriggerVk = WM_APP + 0x491;
 constexpr UINT kMsgSendChat = WM_APP + 0x492;
@@ -37,6 +38,7 @@ constexpr UINT kMsgRefreshIdentity = WM_APP + 0x493;
 constexpr UINT kMsgTriggerPageSlot = WM_APP + 0x494;
 constexpr UINT kMsgMoveToLocation = WM_APP + 0x495;
 constexpr UINT kMsgSetWalkBypass = WM_APP + 0x496;
+constexpr UINT kMsgSetActionMode = WM_APP + 0x497;
 constexpr DWORD kPipeBufferSize = 65536;
 constexpr DWORD kDispatchTimeoutMs = 2000;
 constexpr DWORD kPipeStartupTimeoutMs = 2000;
@@ -63,9 +65,17 @@ constexpr UINT kExpectedCurrentPlayerResolver = 0x00407850;
 constexpr UINT kExpectedPlayerNameBuilder = 0x004CEF20;
 constexpr UINT kExpectedNwnStringDestroy = 0x005BA420;
 constexpr UINT kExpectedWalkToWaypoint = 0x00407D70;
+constexpr UINT kExpectedToggleModeInput = 0x004D00B0;
 constexpr UINT kExpectedWalkNoWalkBlock = 0x0042A7AB;
 constexpr UINT kExpectedWalkNoWalkBypassTarget = 0x0042A7D2;
+constexpr UINT kExpectedServerObjectByIdResolver = 0x005FFAA0;
+constexpr UINT kExpectedSetActionMode = 0x00658BD0;
+constexpr UINT kExpectedGetActionMode = 0x00658A50;
 constexpr uint32_t kCurrentPlayerPositionOffset = 0x2Cu;
+constexpr uint32_t kClientCreatureDefensiveCastingStateOffset = 0x184u;
+constexpr uint32_t kCreatureDefensiveCastingModeOffset = 0x4AAu;
+constexpr uint32_t kCreatureCurrentCombatModeOffset = 0x4ABu;
+constexpr uint32_t kObjectAsCreatureVtableOffset = 0x30u;
 constexpr uint32_t kQuickbarPanelSlotsOffset = 0x68u;
 constexpr uint32_t kQuickbarCurrentPageOffset = 0x2BB8u;
 constexpr uint32_t kQuickbarPageStride = 0xE70u;
@@ -77,6 +87,7 @@ constexpr uint32_t kInvalidObjectId = 0x7F000000u;
 constexpr BYTE kQuickbarItemSlotType = 1;
 constexpr int kQuickbarPageCount = 3;
 constexpr int kQuickbarSlotCount = 12;
+constexpr int kActionModeDefensiveCast = 10;
 constexpr int kPendingChatCapacity = 1024;
 constexpr int kChatQueueCapacity = 1024;
 constexpr int kChatTextCapacity = 768;
@@ -157,6 +168,7 @@ struct QueryResponse {
   int32_t last_error;
   int32_t log_level;
   uint32_t player_object;
+  uint32_t player_creature;
   int32_t identity_refresh_count;
   int32_t identity_error;
   uint32_t quickbar_item_mask_low;
@@ -214,6 +226,20 @@ struct WalkBypassRequest {
 struct WalkBypassResponse {
   int32_t success;
   int32_t enabled;
+  int32_t last_error;
+};
+
+struct SetActionModeRequest {
+  int32_t mode;
+  int32_t enabled;
+};
+
+struct SetActionModeResponse {
+  int32_t success;
+  int32_t mode;
+  int32_t enabled;
+  int32_t active;
+  int32_t rc;
   int32_t last_error;
 };
 
@@ -282,6 +308,18 @@ struct PendingWalkBypassDispatch {
   volatile LONG request_id;
   volatile LONG enabled;
   volatile LONG result;
+  volatile LONG last_error;
+};
+
+struct PendingCombatModeDispatch {
+  HANDLE event;
+  volatile LONG busy;
+  volatile LONG sequence_seed;
+  volatile LONG request_id;
+  volatile LONG mode;
+  volatile LONG enabled;
+  volatile LONG result;
+  volatile LONG active;
   volatile LONG last_error;
 };
 
@@ -358,6 +396,7 @@ struct SimKeysState {
   PendingIdentityDispatch pending_identity;
   PendingMoveDispatch pending_move;
   PendingWalkBypassDispatch pending_walk_bypass;
+  PendingCombatModeDispatch pending_combat_mode;
   HANDLE log_file;
   char module_path[MAX_PATH];
   char log_path[MAX_PATH];
@@ -393,6 +432,7 @@ struct SimKeysState {
   volatile LONG quickbar_equipped_mask_high;
   volatile LONG log_level;
   volatile LONG player_object;
+  volatile LONG player_creature;
   volatile LONG identity_refresh_count;
   volatile LONG identity_error;
   volatile LONG walk_no_walk_bypass_enabled;
@@ -460,6 +500,7 @@ BOOL InstallChatWindowLogHook();
 BOOL InstallOverlayHook();
 BOOL RefreshCharacterIdentity(DWORD* out_error);
 BOOL SetWalkNoWalkBypassEnabledOnWindowThread(BOOL enabled);
+BOOL SetActionModeOnWindowThread(LONG mode, BOOL enabled, LONG* out_active, DWORD* out_error);
 void UpdateQuickbarItemMasksOnWindowThread();
 
 uintptr_t GetProcessImageBase() {
@@ -552,6 +593,188 @@ BOOL TryReadCurrentPlayerPosition(float* out_x, float* out_y, float* out_z) {
   *out_x = x;
   *out_y = y;
   *out_z = z;
+  SetLastError(ERROR_SUCCESS);
+  return TRUE;
+}
+
+BOOL ReadDefensiveCastingModeByte(uint32_t creature, LONG* out_active) {
+  if (out_active == nullptr) {
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return FALSE;
+  }
+  *out_active = 0;
+
+  if (creature == 0) {
+    SetLastError(ERROR_NOT_FOUND);
+    return FALSE;
+  }
+
+  BYTE value = 0;
+  if (!SafeReadValue(static_cast<uintptr_t>(creature) + kCreatureDefensiveCastingModeOffset, &value)) {
+    SetLastError(ERROR_INVALID_DATA);
+    return FALSE;
+  }
+  if (value > 1) {
+    SetLastError(ERROR_INVALID_DATA);
+    return FALSE;
+  }
+
+  *out_active = static_cast<LONG>(value);
+  SetLastError(ERROR_SUCCESS);
+  return TRUE;
+}
+
+BOOL ReadClientDefensiveCastingModeFlag(uint32_t client_creature, LONG* out_active) {
+  if (out_active == nullptr) {
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return FALSE;
+  }
+  *out_active = 0;
+
+  if (client_creature == 0) {
+    SetLastError(ERROR_NOT_FOUND);
+    return FALSE;
+  }
+
+  DWORD value = 0;
+  if (!SafeReadValue(
+          static_cast<uintptr_t>(client_creature) + kClientCreatureDefensiveCastingStateOffset,
+          &value)) {
+    SetLastError(ERROR_INVALID_DATA);
+    return FALSE;
+  }
+  if (value > 1) {
+    SetLastError(ERROR_INVALID_DATA);
+    return FALSE;
+  }
+
+  *out_active = static_cast<LONG>(value);
+  SetLastError(ERROR_SUCCESS);
+  return TRUE;
+}
+
+BOOL ResolveCreatureFromObjectPointer(uint32_t game_object, uint32_t* out_creature, DWORD* out_error) {
+  if (out_creature == nullptr) {
+    if (out_error != nullptr) {
+      *out_error = ERROR_INVALID_PARAMETER;
+    }
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return FALSE;
+  }
+  *out_creature = 0;
+
+  if (game_object == 0) {
+    if (out_error != nullptr) {
+      *out_error = ERROR_NOT_FOUND;
+    }
+    SetLastError(ERROR_NOT_FOUND);
+    return FALSE;
+  }
+
+  uint32_t vtable = 0;
+  uint32_t method = 0;
+  if (!SafeReadValue(static_cast<uintptr_t>(game_object), &vtable) ||
+      vtable == 0 ||
+      !SafeReadValue(static_cast<uintptr_t>(vtable) + kObjectAsCreatureVtableOffset, &method) ||
+      method == 0) {
+    if (out_error != nullptr) {
+      *out_error = ERROR_INVALID_DATA;
+    }
+    SetLastError(ERROR_INVALID_DATA);
+    return FALSE;
+  }
+
+  typedef void* (__thiscall* AsCreatureFn)(void* game_object);
+  const AsCreatureFn as_creature = reinterpret_cast<AsCreatureFn>(method);
+  void* creature = nullptr;
+  DWORD last_error = ERROR_SUCCESS;
+  __try {
+    creature = as_creature(reinterpret_cast<void*>(game_object));
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    last_error = static_cast<DWORD>(GetExceptionCode());
+  }
+
+  if (last_error == ERROR_SUCCESS && creature == nullptr) {
+    last_error = ERROR_NOT_FOUND;
+  }
+  if (last_error != ERROR_SUCCESS) {
+    if (out_error != nullptr) {
+      *out_error = last_error;
+    }
+    SetLastError(last_error);
+    return FALSE;
+  }
+
+  *out_creature = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(creature));
+  if (out_error != nullptr) {
+    *out_error = ERROR_SUCCESS;
+  }
+  SetLastError(ERROR_SUCCESS);
+  return TRUE;
+}
+
+BOOL ResolveCurrentCreatureFromObjectId(uint32_t* out_game_object, uint32_t* out_creature, DWORD* out_error) {
+  if (out_game_object == nullptr || out_creature == nullptr) {
+    if (out_error != nullptr) {
+      *out_error = ERROR_INVALID_PARAMETER;
+    }
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return FALSE;
+  }
+  *out_game_object = 0;
+  *out_creature = 0;
+
+  const uint32_t object_id = ReadCurrentPlayerObjectId();
+  const uint32_t app_holder = ReadAppHolderPointer();
+  const uint32_t server_app = app_holder != 0 ? SafeReadPointer32(static_cast<uintptr_t>(app_holder) + 4u) : 0;
+  if (object_id == 0 || object_id == kInvalidObjectId || server_app == 0) {
+    if (out_error != nullptr) {
+      *out_error = ERROR_NOT_FOUND;
+    }
+    SetLastError(ERROR_NOT_FOUND);
+    return FALSE;
+  }
+
+  typedef void* (__thiscall* ResolveServerObjectByIdFn)(void* server_app, uint32_t object_id);
+  const ResolveServerObjectByIdFn resolve_server_object =
+      reinterpret_cast<ResolveServerObjectByIdFn>(RebaseAddress(kExpectedServerObjectByIdResolver));
+
+  void* game_object = nullptr;
+  DWORD last_error = ERROR_SUCCESS;
+  __try {
+    game_object = resolve_server_object(reinterpret_cast<void*>(server_app), object_id);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    last_error = static_cast<DWORD>(GetExceptionCode());
+  }
+
+  if (last_error == ERROR_SUCCESS && game_object == nullptr) {
+    last_error = ERROR_NOT_FOUND;
+  }
+  if (last_error != ERROR_SUCCESS) {
+    if (out_error != nullptr) {
+      *out_error = last_error;
+    }
+    SetLastError(last_error);
+    return FALSE;
+  }
+
+  uint32_t creature = 0;
+  if (!ResolveCreatureFromObjectPointer(
+          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(game_object)),
+          &creature,
+          &last_error)) {
+    if (out_error != nullptr) {
+      *out_error = last_error;
+    }
+    SetLastError(last_error);
+    return FALSE;
+  }
+
+  *out_game_object = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(game_object));
+  *out_creature = creature;
+  if (out_error != nullptr) {
+    *out_error = ERROR_SUCCESS;
+  }
   SetLastError(ERROR_SUCCESS);
   return TRUE;
 }
@@ -2338,6 +2561,9 @@ void BuildSnapshotText(const char* reason, char* out, size_t capacity) {
   const uint32_t runtime_player_name_builder = RebaseAddress(kExpectedPlayerNameBuilder);
   const uint32_t runtime_nwn_string_destroy = RebaseAddress(kExpectedNwnStringDestroy);
   const uint32_t runtime_walk_to_waypoint = RebaseAddress(kExpectedWalkToWaypoint);
+  const uint32_t runtime_server_object_by_id = RebaseAddress(kExpectedServerObjectByIdResolver);
+  const uint32_t runtime_set_action_mode = RebaseAddress(kExpectedSetActionMode);
+  const uint32_t runtime_get_action_mode = RebaseAddress(kExpectedGetActionMode);
   char character_name[kCharacterNameCapacity] = {};
   CopyStoredCharacterName(character_name, ARRAYSIZE(character_name));
   const LONG quickbar_slot_type = InterlockedCompareExchange(&g_state.quickbar_slot_type, 0, 0);
@@ -2477,8 +2703,32 @@ void BuildSnapshotText(const char* reason, char* out, size_t capacity) {
       static_cast<double>(position_x),
       static_cast<double>(position_y),
       static_cast<double>(position_z));
-  AppendFormat(out, capacity, &offset, "identity: player=0x%08X name=%s refreshes=%ld err=%ld\r\n",
-      static_cast<uint32_t>(InterlockedCompareExchange(&g_state.player_object, 0, 0)),
+  uint32_t snapshot_player_object = static_cast<uint32_t>(InterlockedCompareExchange(&g_state.player_object, 0, 0));
+  uint32_t snapshot_creature = static_cast<uint32_t>(InterlockedCompareExchange(&g_state.player_creature, 0, 0));
+  LONG client_defensive_casting = -1;
+  if (!ReadClientDefensiveCastingModeFlag(snapshot_player_object, &client_defensive_casting)) {
+    client_defensive_casting = -1;
+  }
+  LONG server_defensive_casting = -1;
+  if (!ReadDefensiveCastingModeByte(snapshot_creature, &server_defensive_casting)) {
+    server_defensive_casting = -1;
+  }
+  BYTE current_combat_mode = 0xFF;
+  if (snapshot_creature != 0) {
+    SafeReadValue(static_cast<uintptr_t>(snapshot_creature) + kCreatureCurrentCombatModeOffset, &current_combat_mode);
+  }
+  AppendFormat(out, capacity, &offset, "actionMode: serverObjectById=0x%08X set=0x%08X get=0x%08X clientCreature=0x%08X dcmClient=%ld serverCreature=0x%08X dcmServer=%ld currentCombatMode=%u\r\n",
+      runtime_server_object_by_id,
+      runtime_set_action_mode,
+      runtime_get_action_mode,
+      snapshot_player_object,
+      client_defensive_casting,
+      snapshot_creature,
+      server_defensive_casting,
+      static_cast<unsigned int>(current_combat_mode));
+  AppendFormat(out, capacity, &offset, "identity: player=0x%08X creature=0x%08X name=%s refreshes=%ld err=%ld\r\n",
+      snapshot_player_object,
+      snapshot_creature,
       character_name[0] != '\0' ? character_name : "<unknown>",
       InterlockedCompareExchange(&g_state.identity_refresh_count, 0, 0),
       InterlockedCompareExchange(&g_state.identity_error, 0, 0));
@@ -2676,8 +2926,11 @@ BOOL ResolveCurrentCharacterIdentityOnWindowThread(DWORD* out_error) {
   typedef void (__thiscall* DestroyNwnStringFn)(NwnStringRef* text_object);
 
   DWORD last_error = ERROR_SUCCESS;
+  DWORD creature_error = ERROR_SUCCESS;
   void* app_object = nullptr;
   void* player_object = nullptr;
+  uint32_t player_server_object = 0;
+  uint32_t player_creature = 0;
   NwnStringRef name = {};
   char local_name[kCharacterNameCapacity] = {};
 
@@ -2730,8 +2983,24 @@ BOOL ResolveCurrentCharacterIdentityOnWindowThread(DWORD* out_error) {
     }
   }
 
+  if (!ResolveCurrentCreatureFromObjectId(&player_server_object, &player_creature, &creature_error)) {
+    player_creature = 0;
+    if (player_object != nullptr) {
+      DWORD fallback_error = ERROR_SUCCESS;
+      if (ResolveCreatureFromObjectPointer(
+              static_cast<uint32_t>(reinterpret_cast<uintptr_t>(player_object)),
+              &player_creature,
+              &fallback_error)) {
+        creature_error = ERROR_SUCCESS;
+      } else if (creature_error == ERROR_SUCCESS) {
+        creature_error = fallback_error;
+      }
+    }
+  }
+
   StoreCharacterName(last_error == ERROR_SUCCESS ? local_name : "");
   InterlockedExchange(&g_state.player_object, static_cast<LONG>(reinterpret_cast<uintptr_t>(player_object)));
+  InterlockedExchange(&g_state.player_creature, static_cast<LONG>(player_creature));
   InterlockedExchange(&g_state.identity_error, static_cast<LONG>(last_error));
   InterlockedIncrement(&g_state.identity_refresh_count);
   UpdateQuickbarItemMasksOnWindowThread();
@@ -2739,20 +3008,26 @@ BOOL ResolveCurrentCharacterIdentityOnWindowThread(DWORD* out_error) {
   if (last_error == ERROR_SUCCESS) {
     LogMessage(
         kLogDebug,
-        "identity refresh resolved holder=0x%08X app=0x%08X player=0x%08X namePtr=0x%08X nameLen=%ld name=%s",
+        "identity refresh resolved holder=0x%08X app=0x%08X player=0x%08X serverObject=0x%08X creature=0x%08X creatureErr=%lu namePtr=0x%08X nameLen=%ld name=%s",
         app_holder,
         static_cast<unsigned int>(reinterpret_cast<uintptr_t>(app_object)),
         static_cast<unsigned int>(reinterpret_cast<uintptr_t>(player_object)),
+        player_server_object,
+        player_creature,
+        static_cast<unsigned long>(creature_error),
         static_cast<unsigned int>(reinterpret_cast<uintptr_t>(name.text)),
         static_cast<long>(name.length),
         local_name);
   } else {
     LogMessage(
         kLogDebug,
-        "identity refresh failed holder=0x%08X app=0x%08X player=0x%08X namePtr=0x%08X nameLen=%ld err=%lu",
+        "identity refresh failed holder=0x%08X app=0x%08X player=0x%08X serverObject=0x%08X creature=0x%08X creatureErr=%lu namePtr=0x%08X nameLen=%ld err=%lu",
         app_holder,
         static_cast<unsigned int>(reinterpret_cast<uintptr_t>(app_object)),
         static_cast<unsigned int>(reinterpret_cast<uintptr_t>(player_object)),
+        player_server_object,
+        player_creature,
+        static_cast<unsigned long>(creature_error),
         static_cast<unsigned int>(reinterpret_cast<uintptr_t>(name.text)),
         static_cast<long>(name.length),
         static_cast<unsigned long>(last_error));
@@ -2762,6 +3037,263 @@ BOOL ResolveCurrentCharacterIdentityOnWindowThread(DWORD* out_error) {
     *out_error = last_error;
   }
   return last_error == ERROR_SUCCESS;
+}
+
+BOOL EnsureCurrentPlayerObjectOnWindowThread(uint32_t* out_player_object, DWORD* out_error) {
+  if (out_player_object == nullptr) {
+    if (out_error != nullptr) {
+      *out_error = ERROR_INVALID_PARAMETER;
+    }
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return FALSE;
+  }
+  *out_player_object = 0;
+
+  uint32_t player_object = static_cast<uint32_t>(InterlockedCompareExchange(&g_state.player_object, 0, 0));
+  if (player_object == 0) {
+    DWORD identity_error = ERROR_SUCCESS;
+    ResolveCurrentCharacterIdentityOnWindowThread(&identity_error);
+    player_object = static_cast<uint32_t>(InterlockedCompareExchange(&g_state.player_object, 0, 0));
+  }
+
+  if (player_object == 0) {
+    typedef void* (__thiscall* ResolveAppObjectFn)(void* app_holder);
+    typedef void* (__thiscall* ResolveCurrentPlayerFn)(void* app_object);
+
+    const uint32_t app_holder = ReadAppHolderPointer();
+    if (app_holder == 0) {
+      if (out_error != nullptr) {
+        *out_error = ERROR_NOT_FOUND;
+      }
+      SetLastError(ERROR_NOT_FOUND);
+      return FALSE;
+    }
+
+    const ResolveAppObjectFn resolve_app_object =
+        reinterpret_cast<ResolveAppObjectFn>(RebaseAddress(kExpectedAppObjectResolver));
+    const ResolveCurrentPlayerFn resolve_current_player =
+        reinterpret_cast<ResolveCurrentPlayerFn>(RebaseAddress(kExpectedCurrentPlayerResolver));
+
+    void* app_object = nullptr;
+    void* resolved_player = nullptr;
+    DWORD last_error = ERROR_SUCCESS;
+    __try {
+      app_object = resolve_app_object(reinterpret_cast<void*>(app_holder));
+      if (app_object != nullptr) {
+        resolved_player = resolve_current_player(app_object);
+      }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      last_error = static_cast<DWORD>(GetExceptionCode());
+    }
+
+    if (last_error == ERROR_SUCCESS && resolved_player == nullptr) {
+      last_error = ERROR_NOT_FOUND;
+    }
+    if (last_error != ERROR_SUCCESS) {
+      if (out_error != nullptr) {
+        *out_error = last_error;
+      }
+      SetLastError(last_error);
+      return FALSE;
+    }
+
+    player_object = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(resolved_player));
+    InterlockedExchange(&g_state.player_object, static_cast<LONG>(player_object));
+  }
+
+  *out_player_object = player_object;
+  if (out_error != nullptr) {
+    *out_error = ERROR_SUCCESS;
+  }
+  SetLastError(ERROR_SUCCESS);
+  return TRUE;
+}
+
+BOOL TriggerToggleModeInputOnWindowThread(LONG mode, uint32_t target_object_id, LONG* out_active, DWORD* out_error) {
+  if (out_active != nullptr) {
+    *out_active = -1;
+  }
+
+  uint32_t player_object = 0;
+  DWORD last_error = ERROR_SUCCESS;
+  if (!EnsureCurrentPlayerObjectOnWindowThread(&player_object, &last_error)) {
+    if (out_error != nullptr) {
+      *out_error = last_error;
+    }
+    return FALSE;
+  }
+
+  typedef void (__thiscall* ToggleModeInputFn)(void* player_object, int mode, uint32_t target_object_id);
+  const ToggleModeInputFn toggle_mode_input =
+      reinterpret_cast<ToggleModeInputFn>(RebaseAddress(kExpectedToggleModeInput));
+
+  const uint32_t resolved_target = target_object_id != 0 ? target_object_id : kInvalidObjectId;
+  __try {
+    toggle_mode_input(reinterpret_cast<void*>(player_object), static_cast<int>(mode), resolved_target);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    last_error = static_cast<DWORD>(GetExceptionCode());
+  }
+
+  if (last_error != ERROR_SUCCESS) {
+    if (out_error != nullptr) {
+      *out_error = last_error;
+    }
+    SetLastError(last_error);
+    LogMessage(
+        kLogError,
+        "toggle mode input failed mode=%ld player=0x%08X target=0x%08X err=0x%08lX",
+        mode,
+        player_object,
+        resolved_target,
+        static_cast<unsigned long>(last_error));
+    return FALSE;
+  }
+
+  if (out_error != nullptr) {
+    *out_error = ERROR_SUCCESS;
+  }
+  SetLastError(ERROR_SUCCESS);
+  LogMessage(
+      kLogInfo,
+      "toggle mode input dispatched mode=%ld player=0x%08X target=0x%08X active=unknown",
+      mode,
+      player_object,
+      resolved_target);
+  return TRUE;
+}
+
+BOOL EnsureCurrentPlayerCreatureOnWindowThread(uint32_t* out_player_object, uint32_t* out_creature, DWORD* out_error) {
+  if (out_player_object == nullptr || out_creature == nullptr) {
+    if (out_error != nullptr) {
+      *out_error = ERROR_INVALID_PARAMETER;
+    }
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return FALSE;
+  }
+
+  uint32_t player_object = static_cast<uint32_t>(InterlockedCompareExchange(&g_state.player_object, 0, 0));
+  uint32_t creature = static_cast<uint32_t>(InterlockedCompareExchange(&g_state.player_creature, 0, 0));
+  if (player_object == 0 || creature == 0) {
+    DWORD identity_error = ERROR_SUCCESS;
+    ResolveCurrentCharacterIdentityOnWindowThread(&identity_error);
+    player_object = static_cast<uint32_t>(InterlockedCompareExchange(&g_state.player_object, 0, 0));
+    creature = static_cast<uint32_t>(InterlockedCompareExchange(&g_state.player_creature, 0, 0));
+  }
+
+  if (creature == 0) {
+    DWORD creature_error = ERROR_SUCCESS;
+    uint32_t server_object = 0;
+    if (!ResolveCurrentCreatureFromObjectId(&server_object, &creature, &creature_error) &&
+        (player_object == 0 ||
+         !ResolveCreatureFromObjectPointer(player_object, &creature, &creature_error))) {
+      if (out_error != nullptr) {
+        *out_error = creature_error;
+      }
+      SetLastError(creature_error);
+      return FALSE;
+    }
+    InterlockedExchange(&g_state.player_creature, static_cast<LONG>(creature));
+  }
+
+  *out_player_object = player_object;
+  *out_creature = creature;
+  if (out_error != nullptr) {
+    *out_error = ERROR_SUCCESS;
+  }
+  SetLastError(ERROR_SUCCESS);
+  return TRUE;
+}
+
+BOOL SetActionModeOnWindowThread(LONG mode, BOOL enabled, LONG* out_active, DWORD* out_error) {
+  if (out_active != nullptr) {
+    *out_active = 0;
+  }
+
+  if (mode < 0 || mode > 12) {
+    if (out_error != nullptr) {
+      *out_error = ERROR_INVALID_PARAMETER;
+    }
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return FALSE;
+  }
+
+  if (mode == kActionModeDefensiveCast) {
+    if (!enabled) {
+      if (out_error != nullptr) {
+        *out_error = ERROR_NOT_SUPPORTED;
+      }
+      SetLastError(ERROR_NOT_SUPPORTED);
+      return FALSE;
+    }
+    return TriggerToggleModeInputOnWindowThread(mode, kInvalidObjectId, out_active, out_error);
+  }
+
+  uint32_t player_object = 0;
+  uint32_t creature = 0;
+  DWORD last_error = ERROR_SUCCESS;
+  if (!EnsureCurrentPlayerCreatureOnWindowThread(&player_object, &creature, &last_error)) {
+    if (out_error != nullptr) {
+      *out_error = last_error;
+    }
+    return FALSE;
+  }
+
+  typedef void (__thiscall* SetActionModeFn)(void* creature, unsigned char mode, int enabled);
+  typedef int (__thiscall* GetActionModeFn)(void* creature, unsigned char mode);
+  const SetActionModeFn set_action_mode =
+      reinterpret_cast<SetActionModeFn>(RebaseAddress(kExpectedSetActionMode));
+  const GetActionModeFn get_action_mode =
+      reinterpret_cast<GetActionModeFn>(RebaseAddress(kExpectedGetActionMode));
+
+  LONG active = 0;
+  __try {
+    set_action_mode(
+        reinterpret_cast<void*>(creature),
+        static_cast<unsigned char>(mode),
+        enabled ? 1 : 0);
+    active = get_action_mode(reinterpret_cast<void*>(creature), static_cast<unsigned char>(mode)) ? 1 : 0;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    last_error = static_cast<DWORD>(GetExceptionCode());
+  }
+
+  if (last_error != ERROR_SUCCESS) {
+    if (out_error != nullptr) {
+      *out_error = last_error;
+    }
+    SetLastError(last_error);
+    LogMessage(
+        kLogError,
+        "set action mode failed mode=%ld enabled=%ld player=0x%08X creature=0x%08X err=0x%08lX",
+        mode,
+        enabled ? 1L : 0L,
+        player_object,
+        creature,
+        static_cast<unsigned long>(last_error));
+    return FALSE;
+  }
+
+  if (mode == kActionModeDefensiveCast) {
+    LONG defensive_casting = 0;
+    if (ReadDefensiveCastingModeByte(creature, &defensive_casting)) {
+      active = defensive_casting;
+    }
+  }
+
+  if (out_active != nullptr) {
+    *out_active = active;
+  }
+  if ((enabled && active == 0) || (!enabled && active != 0)) {
+    if (out_error != nullptr) {
+      *out_error = ERROR_GEN_FAILURE;
+    }
+    SetLastError(ERROR_GEN_FAILURE);
+    return FALSE;
+  }
+  if (out_error != nullptr) {
+    *out_error = ERROR_SUCCESS;
+  }
+  SetLastError(ERROR_SUCCESS);
+  return TRUE;
 }
 
 BOOL ReadExact(HANDLE handle, void* buffer, DWORD size) {
@@ -3151,6 +3683,54 @@ LRESULT CALLBACK SimKeysWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM l
     InterlockedExchange(&g_state.pending_walk_bypass.result, rc);
     InterlockedExchange(&g_state.pending_walk_bypass.last_error, static_cast<LONG>(last_error));
     SetEvent(g_state.pending_walk_bypass.event);
+    return 0;
+  }
+
+  if (message == kMsgSetActionMode) {
+    const LONG request_id = static_cast<LONG>(lparam);
+    if (request_id != InterlockedCompareExchange(&g_state.pending_combat_mode.request_id, 0, 0)) {
+      return 0;
+    }
+
+    const LONG mode = InterlockedCompareExchange(&g_state.pending_combat_mode.mode, 0, 0);
+    const LONG enabled = InterlockedCompareExchange(&g_state.pending_combat_mode.enabled, 0, 0);
+    DWORD last_error = ERROR_SUCCESS;
+    LONG rc = 0;
+    LONG active = 0;
+
+    __try {
+      rc = SetActionModeOnWindowThread(mode, enabled ? TRUE : FALSE, &active, &last_error) ? 1 : 0;
+      if (rc == 0 && last_error == ERROR_SUCCESS) {
+        last_error = GetLastError();
+        if (last_error == ERROR_SUCCESS) {
+          last_error = ERROR_GEN_FAILURE;
+        }
+      }
+      LogMessage(
+          last_error == ERROR_SUCCESS ? kLogInfo : kLogError,
+          "set action mode dispatched mode=%ld enabled=%ld active=%ld rc=%ld err=%lu",
+          mode,
+          enabled,
+          active,
+          rc,
+          static_cast<unsigned long>(last_error));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      last_error = static_cast<DWORD>(GetExceptionCode());
+      rc = 0;
+      active = 0;
+      LogMessage(
+          kLogError,
+          "set action mode raised exception mode=%ld enabled=%ld code=0x%08lX",
+          mode,
+          enabled,
+          static_cast<unsigned long>(last_error));
+    }
+
+    InterlockedExchange(&g_state.pending_combat_mode.result, rc);
+    InterlockedExchange(&g_state.pending_combat_mode.active, active);
+    InterlockedExchange(&g_state.pending_combat_mode.last_error, static_cast<LONG>(last_error));
+    UpdateLastOperation(0, rc, last_error);
+    SetEvent(g_state.pending_combat_mode.event);
     return 0;
   }
 
@@ -3754,6 +4334,87 @@ BOOL TriggerSetWalkNoWalkBypass(BOOL enabled, DWORD* out_error) {
   return last_error == ERROR_SUCCESS && result != 0;
 }
 
+BOOL TriggerSetActionMode(LONG mode, BOOL enabled, LONG* out_rc, LONG* out_active, DWORD* out_error) {
+  if (out_rc != nullptr) {
+    *out_rc = 0;
+  }
+  if (out_active != nullptr) {
+    *out_active = 0;
+  }
+
+  if (!EnsureHookInstalled()) {
+    const DWORD gle = GetLastError();
+    if (out_error != nullptr) {
+      *out_error = gle;
+    }
+    return FALSE;
+  }
+
+  if (InterlockedCompareExchange(&g_state.pending_combat_mode.busy, 1, 0) != 0) {
+    if (out_error != nullptr) {
+      *out_error = ERROR_BUSY;
+    }
+    LogMessage(kLogError, "set action mode rejected because a previous request is still in flight");
+    return FALSE;
+  }
+
+  const LONG request_id = InterlockedIncrement(&g_state.pending_combat_mode.sequence_seed);
+  InterlockedExchange(&g_state.pending_combat_mode.request_id, request_id);
+  InterlockedExchange(&g_state.pending_combat_mode.mode, mode);
+  InterlockedExchange(&g_state.pending_combat_mode.enabled, enabled ? 1 : 0);
+  InterlockedExchange(&g_state.pending_combat_mode.result, 0);
+  InterlockedExchange(&g_state.pending_combat_mode.active, 0);
+  InterlockedExchange(&g_state.pending_combat_mode.last_error, ERROR_IO_PENDING);
+  ResetEvent(g_state.pending_combat_mode.event);
+
+  if (!PostMessageA(g_state.hwnd, kMsgSetActionMode, 0, static_cast<LPARAM>(request_id))) {
+    const DWORD gle = GetLastError();
+    InterlockedExchange(&g_state.pending_combat_mode.busy, 0);
+    if (out_error != nullptr) {
+      *out_error = gle;
+    }
+    LogMessage(kLogError, "PostMessageA(set action mode) failed gle=%lu", gle);
+    return FALSE;
+  }
+
+  const DWORD wait_rc = WaitForSingleObject(g_state.pending_combat_mode.event, kDispatchTimeoutMs);
+  const LONG result = InterlockedCompareExchange(&g_state.pending_combat_mode.result, 0, 0);
+  const LONG active = InterlockedCompareExchange(&g_state.pending_combat_mode.active, 0, 0);
+  const DWORD last_error = static_cast<DWORD>(InterlockedCompareExchange(&g_state.pending_combat_mode.last_error, 0, 0));
+  InterlockedExchange(&g_state.pending_combat_mode.busy, 0);
+
+  if (wait_rc != WAIT_OBJECT_0) {
+    const DWORD gle = (wait_rc == WAIT_TIMEOUT) ? WAIT_TIMEOUT : GetLastError();
+    if (out_rc != nullptr) {
+      *out_rc = result;
+    }
+    if (out_active != nullptr) {
+      *out_active = active;
+    }
+    if (out_error != nullptr) {
+      *out_error = gle;
+    }
+    LogMessage(
+        kLogError,
+        "set action mode wait failed wait_rc=%lu gle=%lu result=%ld",
+        static_cast<unsigned long>(wait_rc),
+        static_cast<unsigned long>(gle),
+        result);
+    return FALSE;
+  }
+
+  if (out_rc != nullptr) {
+    *out_rc = result;
+  }
+  if (out_active != nullptr) {
+    *out_active = active;
+  }
+  if (out_error != nullptr) {
+    *out_error = last_error;
+  }
+  return last_error == ERROR_SUCCESS && result != 0;
+}
+
 BOOL RefreshCharacterIdentity(DWORD* out_error) {
   if (!EnsureHookInstalled()) {
     const DWORD gle = GetLastError();
@@ -3871,6 +4532,7 @@ BOOL HandlePipeClient(HANDLE pipe) {
         response.last_error = InterlockedCompareExchange(&g_state.last_error, 0, 0);
         response.log_level = InterlockedCompareExchange(&g_state.log_level, 0, 0);
         response.player_object = static_cast<uint32_t>(InterlockedCompareExchange(&g_state.player_object, 0, 0));
+        response.player_creature = static_cast<uint32_t>(InterlockedCompareExchange(&g_state.player_creature, 0, 0));
         response.identity_refresh_count = InterlockedCompareExchange(&g_state.identity_refresh_count, 0, 0);
         response.identity_error = InterlockedCompareExchange(&g_state.identity_error, 0, 0);
         response.quickbar_item_mask_low =
@@ -4008,6 +4670,45 @@ BOOL HandlePipeClient(HANDLE pipe) {
         }
 
         if (!WriteResponse(pipe, kOpSetWalkBypass, &response, sizeof(response))) {
+          return FALSE;
+        }
+        break;
+      }
+
+      case kOpSetActionMode: {
+        SetActionModeResponse response = {};
+        if (header.size != sizeof(SetActionModeRequest)) {
+          response.last_error = ERROR_INVALID_DATA;
+          UpdateLastOperation(0, 0, ERROR_INVALID_DATA);
+        } else {
+          SetActionModeRequest request = {};
+          memcpy(&request, payload, sizeof(request));
+          LONG rc = 0;
+          LONG active = 0;
+          DWORD last_error = ERROR_SUCCESS;
+          response.success = TriggerSetActionMode(
+              request.mode,
+              request.enabled ? TRUE : FALSE,
+              &rc,
+              &active,
+              &last_error) ? 1 : 0;
+          response.mode = request.mode;
+          response.enabled = request.enabled ? 1 : 0;
+          response.active = active;
+          response.rc = rc;
+          response.last_error = static_cast<int32_t>(last_error);
+          LogMessage(
+              response.success ? kLogInfo : kLogError,
+              "set action mode request mode=%ld enabled=%ld active=%ld success=%ld rc=%ld err=%ld",
+              response.mode,
+              response.enabled,
+              response.active,
+              response.success,
+              response.rc,
+              response.last_error);
+        }
+
+        if (!WriteResponse(pipe, kOpSetActionMode, &response, sizeof(response))) {
           return FALSE;
         }
         break;
@@ -4452,8 +5153,38 @@ SIMKEYS_API DWORD WINAPI InitSimKeys(LPVOID) {
     return 0;
   }
 
+  g_state.pending_combat_mode.event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+  if (g_state.pending_combat_mode.event == nullptr) {
+    CloseHandle(g_state.pending_walk_bypass.event);
+    g_state.pending_walk_bypass.event = nullptr;
+    CloseHandle(g_state.pending_move.event);
+    g_state.pending_move.event = nullptr;
+    CloseHandle(g_state.pending_identity.event);
+    g_state.pending_identity.event = nullptr;
+    CloseHandle(g_state.pending_chat.event);
+    g_state.pending_chat.event = nullptr;
+    CloseHandle(g_state.pending.event);
+    g_state.pending.event = nullptr;
+    if (g_state.log_file != nullptr) {
+      CloseHandle(g_state.log_file);
+      g_state.log_file = nullptr;
+    }
+    g_state.overlay_lock_ready = false;
+    DeleteCriticalSection(&g_state.overlay_lock);
+    g_state.log_lock_ready = false;
+    DeleteCriticalSection(&g_state.log_lock);
+    g_state.chat_lock_ready = false;
+    DeleteCriticalSection(&g_state.chat_lock);
+    g_state.lock_ready = false;
+    DeleteCriticalSection(&g_state.lock);
+    g_state.initialized = 0;
+    return 0;
+  }
+
   g_state.pipe_ready_event = CreateEventA(nullptr, TRUE, FALSE, nullptr);
   if (g_state.pipe_ready_event == nullptr) {
+    CloseHandle(g_state.pending_combat_mode.event);
+    g_state.pending_combat_mode.event = nullptr;
     CloseHandle(g_state.pending_walk_bypass.event);
     g_state.pending_walk_bypass.event = nullptr;
     CloseHandle(g_state.pending_move.event);
@@ -4485,6 +5216,8 @@ SIMKEYS_API DWORD WINAPI InitSimKeys(LPVOID) {
   if (g_state.pipe_thread == nullptr) {
     CloseHandle(g_state.pipe_ready_event);
     g_state.pipe_ready_event = nullptr;
+    CloseHandle(g_state.pending_combat_mode.event);
+    g_state.pending_combat_mode.event = nullptr;
     CloseHandle(g_state.pending_walk_bypass.event);
     g_state.pending_walk_bypass.event = nullptr;
     CloseHandle(g_state.pending_move.event);

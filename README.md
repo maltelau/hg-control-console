@@ -228,7 +228,7 @@ Each utility can be disabled independently from the Always On settings.
 
 ### Auto Combat Mode
 
-Auto Combat Mode keeps one selected combat mode active while the character is attacking.
+Auto Combat Mode keeps one selected combat mode active while combat is happening.
 
 Supported modes:
 
@@ -238,8 +238,9 @@ Supported modes:
 - Improved Expertise: `!action iem self`
 - Power Attack: `!action pam self`
 - Improved Power Attack: `!action ipm self`
+- Defensive Casting: client `Input_ToggleMode(10)`
 
-Rapid Shot uses an NWN memory byte to determine whether RSM is already active. The other modes read attack-mode prefixes from combat-log attack lines. The script uses a retry cooldown and can echo trigger feedback to the in-game console.
+Rapid Shot uses an NWN memory byte to determine whether RSM is already active. Defensive Casting is triggered through the client input path because there is no HG chat action for it, and it reads the client creature Defensive Casting state flag at offset `+0x184` to determine whether the mode is actually active. Defensive Casting also runs as an upkeep check, retrying every cooldown when it reads as off, so casters can keep it active without making attacks themselves. The other modes read attack-mode prefixes from outgoing combat-log attack lines. The script uses a retry cooldown and can echo trigger feedback to the in-game console.
 
 ### In-Game Timers
 
