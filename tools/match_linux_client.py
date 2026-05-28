@@ -338,14 +338,16 @@ def analyze_linux(image: BinaryImage) -> dict[str, object]:
     )
 
     exec_pattern = (
-        b"\x0F\xB6\x45\x0C"
-        b"\x8D\x1C\x40"
-        b"\xC1\xE3\x05"
-        b"\x01\xC3"
-        b"\xC1\xE3\x02"
-        b"\x03\x5D\x08"
-        b"\x83\xC3\x74"
-        b"\x53\xE8"
+        b"\x0F\xB6\x55\x0C"
+        b"\x8D\x04\x52"
+        b"\x8B\x4D\x08"
+        b"\xC1\xE0\x05"
+        b"\x01\xD0"
+        b"\x8B\x91\x04\x37\x00\x00"
+        b"\x8D\x04\x82"
+        b"\x89\x45\x08"
+        b"\xC9"
+        b"\xE9"
     )
     quickbar_exec, quickbar_exec_hit = find_function_by_pattern(image, exec_pattern)
     targets.append(
@@ -355,8 +357,8 @@ def analyze_linux(image: BinaryImage) -> dict[str, object]:
             quickbar_exec,
             "kExpectedQuickbarExec=0x0051FAA0",
             [
-                f"slot-index math pattern at {hex32(quickbar_exec_hit)} computes slot * 0x184 + panel + 0x74",
-                "Linux wrapper calls the slot-reset helper before tail-jumping into quickbar.slot_dispatch",
+                f"slot-index math pattern at {hex32(quickbar_exec_hit)} computes slot * 0x184 + panel.currentPage",
+                "tail-jumps into quickbar.slot_dispatch without touching the slot-reset helper",
             ],
         )
     )
@@ -394,16 +396,17 @@ def analyze_linux(image: BinaryImage) -> dict[str, object]:
     )
 
     dispatch_pattern = (
-        b"\x8B\x4D\x08"
-        b"\x8B\xB9\x08\x37\x00\x00"
-        b"\x85\xFF"
-        b"\x8B\x75\x0C"
+        b"\x8B\x55\x08"
+        b"\x8A\x42\x04"
+        b"\x83\xF0\x01"
+        b"\x83\xE0\x01"
+        b"\x0F\x84"
     )
     quickbar_dispatch, dispatch_hit = find_function_by_pattern(image, dispatch_pattern)
     dispatch_required = [
         quickbar_dispatch is not None,
-        quickbar_dispatch is not None and has_bytes(image, quickbar_dispatch, 0x80, b"\x0F\xB6\x86\xA0\x00\x00\x00"),
-        quickbar_dispatch is not None and has_bytes(image, quickbar_dispatch, 0x80, b"\xFF\x24\x85\x80\x8F\x5F\x08"),
+        quickbar_dispatch is not None and has_bytes(image, quickbar_dispatch, 0x80, b"\x0F\xB6\x82\xA0\x00\x00\x00"),
+        quickbar_dispatch is not None and has_bytes(image, quickbar_dispatch, 0x80, b"\xFF\x24\x85\x90\x8D\x5F\x08"),
     ]
     targets.append(
         TargetReport(
@@ -412,9 +415,9 @@ def analyze_linux(image: BinaryImage) -> dict[str, object]:
             quickbar_dispatch,
             "kExpectedQuickbarSlotDispatch=0x005164A0",
             [
-                f"entry pattern at {hex32(dispatch_hit)} checks panel+0x3708",
+                f"entry pattern at {hex32(dispatch_hit)} checks the quickbutton enabled flag",
                 "slot type is read from slot+0xA0",
-                "switch table anchor 0x085F8F80",
+                "switch table anchor 0x085F8D90",
             ],
         )
     )
@@ -508,6 +511,33 @@ def analyze_linux(image: BinaryImage) -> dict[str, object]:
             [
                 f"resolver wrapper at {hex32(current_player)}",
                 f"active object-id helper at {hex32(current_object_id)} reads app object +0x24",
+            ],
+        )
+    )
+
+    player_name_pattern = (
+        b"\x8B\x45\x0C"
+        b"\x8B\x5D\x08"
+        b"\xFF\xB0\xBC\x02\x00\x00"
+        b"\x53"
+        b"\xE8"
+    )
+    player_name_builder, player_name_hit = find_function_by_pattern(image, player_name_pattern)
+    nwn_string_destroy = 0x085A61DC if has_bytes(
+        image,
+        0x085A61DC,
+        0x30,
+        b"\x8B\x5D\x08\x8B\x03\x85\xC0\x8B\x75\x0C",
+    ) else None
+    targets.append(
+        TargetReport(
+            "identity.player_name_builder",
+            status_from([player_name_builder is not None, nwn_string_destroy is not None]),
+            player_name_builder,
+            "kExpectedPlayerNameBuilder=0x004CEF20 / kExpectedNwnStringDestroy=0x005BA420",
+            [
+                f"builder wrapper pattern at {hex32(player_name_hit)} reads player+0x2BC",
+                f"NWN string destroy at {hex32(nwn_string_destroy)}",
             ],
         )
     )

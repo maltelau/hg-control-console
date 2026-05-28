@@ -26,7 +26,7 @@
 #include <unistd.h>
 
 extern "C" __attribute__((visibility("hidden"))) void SimKeysLinuxCaptureQuickbarExec(int32_t panel, int32_t slot_index);
-extern "C" __attribute__((visibility("hidden"))) void SimKeysLinuxCaptureQuickbarSlotDispatch(int32_t panel, int32_t slot_ptr);
+extern "C" __attribute__((visibility("hidden"))) void SimKeysLinuxCaptureQuickbarSlotDispatch(int32_t slot_ptr);
 extern "C" __attribute__((visibility("hidden"))) void SimKeysLinuxCaptureChatWindowLog(
     int32_t chat_window,
     const void* nwn_string);
@@ -77,9 +77,9 @@ constexpr uint32_t kOpSetActionMode = 3014;
 
 constexpr uint32_t kImageBase = 0x08048000u;
 constexpr uint32_t kAppGlobalSlotAddress = 0x0862C354u;
-constexpr uint32_t kQuickbarExec = 0x080D9C80u;
+constexpr uint32_t kQuickbarExec = 0x080D9B20u;
 constexpr uint32_t kQuickbarPageSelect = 0x080D6C28u;
-constexpr uint32_t kQuickbarSlotDispatch = 0x080D7DC4u;
+constexpr uint32_t kQuickbarSlotDispatch = 0x080CAA50u;
 constexpr uint32_t kQuickbarPanelVtable = 0x0862F900u;
 constexpr uint32_t kChatSend = 0x08265054u;
 constexpr uint32_t kChatWindowLog = 0x080B89F0u;
@@ -91,6 +91,8 @@ constexpr uint32_t kCurrentClientPlayerResolver = 0x08076A9Cu;
 constexpr uint32_t kServerObjectByIdResolver = 0x082AA024u;
 constexpr uint32_t kSetActionMode = 0x08315B2Cu;
 constexpr uint32_t kGetActionMode = 0x08305538u;
+constexpr uint32_t kPlayerNameBuilder = 0x08138B68u;
+constexpr uint32_t kNwnStringDestroy = 0x085A61DCu;
 
 constexpr uint32_t kQuickbarPanelVtableOffset = 0x20u;
 constexpr uint32_t kQuickbarPanelSlotsOffset = 0x74u;
@@ -763,6 +765,49 @@ int32_t ResolveQuickbarPageIndex(uint32_t panel) {
   return -1;
 }
 
+bool TryDeriveQuickbarPanelFromSlot(uint32_t slot_ptr, uint32_t* out_panel, int32_t* out_index) {
+  if (slot_ptr == 0) {
+    return false;
+  }
+
+  uint32_t candidates[2] = {
+      static_cast<uint32_t>(AtomicGet(&g_state.quickbar_this)),
+      0,
+  };
+  const uint32_t gui = ReadCurrentGuiPointer();
+  if (gui != 0) {
+    candidates[1] = SafeReadPointer32(static_cast<uintptr_t>(gui) + 0x3Cu);
+  }
+
+  for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+    const uint32_t panel = candidates[i];
+    if (!IsQuickbarPanel(panel)) {
+      continue;
+    }
+    const uint32_t base = panel + kQuickbarPanelSlotsOffset;
+    if (slot_ptr < base) {
+      continue;
+    }
+    const uint32_t delta = slot_ptr - base;
+    if (delta % kQuickbarSlotStride != 0) {
+      continue;
+    }
+    const int32_t index = static_cast<int32_t>(delta / kQuickbarSlotStride);
+    if (index < 0 || index >= kQuickbarTotalSlots) {
+      continue;
+    }
+    if (out_panel != nullptr) {
+      *out_panel = panel;
+    }
+    if (out_index != nullptr) {
+      *out_index = index;
+    }
+    return true;
+  }
+
+  return false;
+}
+
 void UpdateQuickbarItemMasks() {
   uint32_t item_low = 0;
   uint32_t item_high = 0;
@@ -882,7 +927,7 @@ void CaptureQuickbarExec(int32_t panel, int32_t slot_index) {
   TryAdoptQuickbarPanel(static_cast<uint32_t>(panel), slot_index, "quickbar-exec");
 }
 
-void CaptureQuickbarSlotDispatch(int32_t panel, int32_t slot_ptr) {
+void CaptureQuickbarSlotDispatch(int32_t slot_ptr) {
   AtomicIncrement(&g_state.quickbar_calls);
   AtomicSet(&g_state.quickbar_slot_ptr, slot_ptr);
   if (slot_ptr != 0) {
@@ -890,16 +935,10 @@ void CaptureQuickbarSlotDispatch(int32_t panel, int32_t slot_ptr) {
     SafeReadValue(static_cast<uintptr_t>(slot_ptr) + kQuickbarSlotTypeOffset, &raw);
     AtomicSet(&g_state.quickbar_slot_type, raw);
   }
-  if (TryAdoptQuickbarPanel(static_cast<uint32_t>(panel), -1, "slot-dispatch") && slot_ptr != 0) {
-    const uint32_t base = static_cast<uint32_t>(panel) + kQuickbarPanelSlotsOffset;
-    const uint32_t delta = static_cast<uint32_t>(slot_ptr) - base;
-    if (delta % kQuickbarSlotStride == 0) {
-      const int32_t index = static_cast<int32_t>(delta / kQuickbarSlotStride);
-      if (index >= 0 && index < kQuickbarTotalSlots) {
-        AtomicSet(&g_state.quickbar_slot, index % kQuickbarSlotCount);
-        AtomicSet(&g_state.quickbar_page, index / kQuickbarSlotCount);
-      }
-    }
+  uint32_t panel = 0;
+  int32_t index = -1;
+  if (TryDeriveQuickbarPanelFromSlot(static_cast<uint32_t>(slot_ptr), &panel, &index)) {
+    TryAdoptQuickbarPanel(panel, index, "slot-dispatch");
   }
 }
 
@@ -932,12 +971,10 @@ __attribute__((naked)) void QuickbarExecTraceThunk() {
 __attribute__((naked)) void QuickbarSlotTraceThunk() {
   asm volatile(
       "pusha\n"
-      "movl 40(%%esp), %%eax\n"
-      "movl 36(%%esp), %%edx\n"
+      "movl 36(%%esp), %%eax\n"
       "pushl %%eax\n"
-      "pushl %%edx\n"
       "call SimKeysLinuxCaptureQuickbarSlotDispatch\n"
-      "addl $8, %%esp\n"
+      "addl $4, %%esp\n"
       "popa\n"
       "jmp *%0\n"
       :
@@ -1005,11 +1042,11 @@ bool InstallInlineHook(uint32_t address, size_t stolen, void* thunk, uint8_t* or
 
 void InstallHooks() {
   if (AtomicGet(&g_state.quickbar_trace_installed) == 0 &&
-      InstallInlineHook(kQuickbarExec, 7, reinterpret_cast<void*>(QuickbarExecTraceThunk), g_quickbar_exec_original, &g_quickbar_exec_gateway)) {
+      InstallInlineHook(kQuickbarExec, 6, reinterpret_cast<void*>(QuickbarExecTraceThunk), g_quickbar_exec_original, &g_quickbar_exec_gateway)) {
     AtomicSet(&g_state.quickbar_trace_installed, 1);
   }
   if (AtomicGet(&g_state.quickbar_slot_trace_installed) == 0 &&
-      InstallInlineHook(kQuickbarSlotDispatch, 9, reinterpret_cast<void*>(QuickbarSlotTraceThunk), g_quickbar_slot_original, &g_quickbar_slot_gateway)) {
+      InstallInlineHook(kQuickbarSlotDispatch, 6, reinterpret_cast<void*>(QuickbarSlotTraceThunk), g_quickbar_slot_original, &g_quickbar_slot_gateway)) {
     AtomicSet(&g_state.quickbar_slot_trace_installed, 1);
   }
   if (AtomicGet(&g_state.chat_trace_installed) == 0 &&
@@ -1093,14 +1130,16 @@ int32_t CallQuickbarExecDirect(int32_t slot_index) {
     return 0;
   }
 
-  typedef void (*QuickbarSlotDispatchFn)(void*, void*);
-  const QuickbarSlotDispatchFn fn = reinterpret_cast<QuickbarSlotDispatchFn>(kQuickbarSlotDispatch);
-  fn(reinterpret_cast<void*>(panel), reinterpret_cast<void*>(slot_ptr));
+  typedef int32_t (*QuickbarExecFn)(void*, int32_t);
+  const QuickbarExecFn fn = reinterpret_cast<QuickbarExecFn>(kQuickbarExec);
+  const int32_t native_rc = fn(reinterpret_cast<void*>(panel), slot_index);
+  (void)native_rc;
 
   const int32_t resolved_page = ResolveQuickbarPageIndex(panel);
   if (resolved_page >= 0) {
     AtomicSet(&g_state.quickbar_page, resolved_page);
   }
+  AtomicSet(&g_state.quickbar_slot_ptr, static_cast<int32_t>(slot_ptr));
   AtomicSet(&g_state.quickbar_slot, slot_index);
   AtomicSet(&g_state.last_result, 1);
   AtomicSet(&g_state.last_error, 0);
@@ -1286,6 +1325,47 @@ uint32_t ResolveCurrentServerCreature(uint32_t* out_game_object) {
       reinterpret_cast<AsCreatureFn>(as_creature_ptr)(game_object)));
 }
 
+bool BuildCurrentPlayerName(uint32_t client_player, char* out, size_t capacity) {
+  struct NwnStringRef {
+    char* text;
+    int32_t length;
+  };
+
+  if (out == nullptr || capacity == 0) {
+    return false;
+  }
+  out[0] = '\0';
+  if (client_player == 0 ||
+      !RangeIsMapped(client_player, 0x2C0u, false) ||
+      !RangeIsMapped(SafeReadPointer32(client_player + 0x2BCu), 0x20u, false)) {
+    return false;
+  }
+
+  NwnStringRef name = {};
+#if defined(__i386__)
+  void* ignored = nullptr;
+  void* const fn = reinterpret_cast<void*>(kPlayerNameBuilder);
+  asm volatile(
+      "pushl %[player]\n"
+      "pushl %[name]\n"
+      "call *%[fn]\n"
+      "addl $4, %%esp\n"
+      : "=a"(ignored)
+      : [fn] "r"(fn), [name] "r"(&name), [player] "r"(reinterpret_cast<void*>(client_player))
+      : "ecx", "edx", "memory", "cc");
+  (void)ignored;
+#else
+  return false;
+#endif
+
+  const bool ok = SafeReadString(&name, out, capacity) && out[0] != '\0';
+  if (name.text != nullptr) {
+    typedef void (*DestroyNwnStringFn)(NwnStringRef*, int32_t);
+    reinterpret_cast<DestroyNwnStringFn>(kNwnStringDestroy)(&name, 2);
+  }
+  return ok;
+}
+
 bool RefreshCharacterIdentity(int32_t* out_error) {
   uint32_t game_object = 0;
   const uint32_t client_player = ResolveCurrentClientPlayer();
@@ -1296,7 +1376,11 @@ bool RefreshCharacterIdentity(int32_t* out_error) {
   float position_y = 0.0f;
   float position_z = 0.0f;
 
-  if (game_object != 0) {
+  if (client_player != 0) {
+    BuildCurrentPlayerName(client_player, name, sizeof(name));
+  }
+
+  if (name[0] == '\0' && game_object != 0) {
     const uint32_t vtable = SafeReadPointer32(game_object);
     const uint32_t first_name_fn = vtable != 0 ? SafeReadPointer32(vtable + 0x98u) : 0;
     const uint32_t last_name_fn = vtable != 0 ? SafeReadPointer32(vtable + 0x9Cu) : 0;
@@ -2363,9 +2447,8 @@ extern "C" __attribute__((visibility("hidden"))) void SimKeysLinuxCaptureQuickba
 }
 
 extern "C" __attribute__((visibility("hidden"))) void SimKeysLinuxCaptureQuickbarSlotDispatch(
-    int32_t panel,
     int32_t slot_ptr) {
-  CaptureQuickbarSlotDispatch(panel, slot_ptr);
+  CaptureQuickbarSlotDispatch(slot_ptr);
 }
 
 extern "C" __attribute__((visibility("hidden"))) void SimKeysLinuxCaptureChatWindowLog(
