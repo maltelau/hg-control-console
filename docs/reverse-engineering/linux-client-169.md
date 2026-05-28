@@ -32,8 +32,9 @@ style as the Diamond hook after validating the exact binary.
 | --- | ---: | ---: | --- |
 | App global slot | `0x0092DC50` | `0x0862C354` | Frequent absolute references in `.text` |
 | Quickbar constructor/layout anchor | `0x008AB6D0` vtable area | `0x080D6538` | Writes `0x0862F900` to `panel+0x20`; slots start at `+0x74`; slot stride is `0x184` |
-| Quickbar execute | `0x0051FAA0` | `0x080D9C80` | Computes `slot * 0x184 + panel + 0x74`; tail-jumps to slot dispatch |
-| Quickbar slot dispatch | `0x005164A0` | `0x080D7DC4` | Checks `panel+0x3708`; reads slot type from `slot+0xA0`; switch table `0x085F8F80` |
+| Quickbar reset/update wrapper | `0x0051FAA0` shape only | `0x080D9C80` | Computes `slot * 0x184 + panel + 0x74`, calls the slot-reset helper, then tail-jumps to slot dispatch. Do not use for HGCC activation. |
+| Quickbar page select | `0x0051FD10` | `0x080D6C28` | Accepts pages `0..2`, rewrites `panel+0x3704`, page stride `0x1230` |
+| Quickbar slot dispatch | `0x005164A0` | `0x080D7DC4` | Checks `panel+0x3708`; reads slot type from `slot+0xA0`; switch table `0x085F8F80`; HGCC activation calls this directly |
 | Chat send/parser | `0x0057C9F0` | `0x08265054` | References `"**Console**: "` and the `tellplayer` command path |
 | Chat window log | `0x00493BD0` | `0x080B89F0` | References `"[CHAT WINDOW TEXT] [%s] %s"` |
 | Current-player resolver | `0x00407850` | `0x08076A9C` | Uses app object `+0x24` as the active player object id |
@@ -47,10 +48,12 @@ Important quickbar layout difference from Windows:
 | Panel vtable check | `panel+0x00 == 0x008AB6D0` | `panel+0x20 == 0x0862F900` |
 | Slot array offset | `0x68` | `0x74` |
 | Slot stride | `0x134` | `0x184` |
+| Current page pointer | `0x2BB8` | `0x3704` |
+| Page stride | `0xE70` | `0x1230` |
 | Primary item id offset | `0x50` | `0x6C` |
 | Secondary item id offset | `0x54` | `0x70` |
 | Slot type offset | `0x84` | `0xA0` |
-| Slot count model | 3 banks x 12 slots | 36 contiguous slots |
+| Slot count model | 3 banks x 12 slots | 3 banks x 12 contiguous slots |
 
 The Linux hook uses a separate scanner with these offsets. Equipped-item owner
 resolution still needs live validation before exposing a non-zero equipped mask.
@@ -81,6 +84,11 @@ The Windows hook cannot be reused directly. Linux support now has a separate
 - IPC: Unix domain socket named `simkeys_<pid>.sock`
 - Thread dispatch: queued HGCC commands drain from `SDL_GL_SwapBuffers` and
   `SDL_PollEvent`, replacing the Windows `WndProc` dispatch path.
+- Quickbar activation: mirrors the Windows direct-call flow. For explicit
+  page requests it calls Linux page-select `0x080D6C28`, dispatches the slot
+  through `0x080D7DC4`, then restores the original page. It deliberately avoids
+  `0x080D9C80` because that Linux wrapper clears/resets the slot before
+  dispatch.
 - Overlay: OpenGL/X11 text rendering from the SDL swap hook. The hook resolves
   those symbols dynamically from the loaded client libraries.
 

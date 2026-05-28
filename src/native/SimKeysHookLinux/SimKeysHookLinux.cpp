@@ -78,6 +78,7 @@ constexpr uint32_t kOpSetActionMode = 3014;
 constexpr uint32_t kImageBase = 0x08048000u;
 constexpr uint32_t kAppGlobalSlotAddress = 0x0862C354u;
 constexpr uint32_t kQuickbarExec = 0x080D9C80u;
+constexpr uint32_t kQuickbarPageSelect = 0x080D6C28u;
 constexpr uint32_t kQuickbarSlotDispatch = 0x080D7DC4u;
 constexpr uint32_t kQuickbarPanelVtable = 0x0862F900u;
 constexpr uint32_t kChatSend = 0x08265054u;
@@ -93,7 +94,10 @@ constexpr uint32_t kGetActionMode = 0x08305538u;
 
 constexpr uint32_t kQuickbarPanelVtableOffset = 0x20u;
 constexpr uint32_t kQuickbarPanelSlotsOffset = 0x74u;
+constexpr uint32_t kQuickbarCurrentPageOffset = 0x3704u;
+constexpr uint32_t kQuickbarEnabledOffset = 0x3708u;
 constexpr uint32_t kQuickbarSlotStride = 0x184u;
+constexpr uint32_t kQuickbarPageStride = 0x1230u;
 constexpr uint32_t kQuickbarSlotPrimaryItemOffset = 0x6Cu;
 constexpr uint32_t kQuickbarSlotSecondaryItemOffset = 0x70u;
 constexpr uint32_t kQuickbarSlotTypeOffset = 0xA0u;
@@ -738,6 +742,27 @@ bool DiscoverQuickbarPanel(const char* reason) {
   return false;
 }
 
+int32_t ResolveQuickbarPageIndex(uint32_t panel) {
+  if (!IsQuickbarPanel(panel)) {
+    return -1;
+  }
+
+  const uint32_t current_page_base = SafeReadPointer32(static_cast<uintptr_t>(panel) + kQuickbarCurrentPageOffset);
+  if (current_page_base == 0) {
+    return -1;
+  }
+
+  for (int32_t page = 0; page < kQuickbarPageCount; ++page) {
+    const uint32_t expected_page_base =
+        panel + kQuickbarPanelSlotsOffset + static_cast<uint32_t>(page) * kQuickbarPageStride;
+    if (current_page_base == expected_page_base) {
+      return page;
+    }
+  }
+
+  return -1;
+}
+
 void UpdateQuickbarItemMasks() {
   uint32_t item_low = 0;
   uint32_t item_high = 0;
@@ -993,29 +1018,147 @@ void InstallHooks() {
   }
 }
 
-int32_t CallQuickbarExecDirect(int32_t page, int32_t slot) {
+uint32_t EnsureQuickbarPanel(const char* reason) {
+  uint32_t panel = AtomicGet(&g_state.quickbar_this);
+  if (!IsQuickbarPanel(panel)) {
+    DiscoverQuickbarPanel(reason);
+    panel = AtomicGet(&g_state.quickbar_this);
+  }
+  return IsQuickbarPanel(panel) ? panel : 0;
+}
+
+bool CallQuickbarPageSelectDirect(int32_t page_index, int32_t* out_resolved_page) {
+  if (page_index < 0 || page_index >= kQuickbarPageCount) {
+    errno = EINVAL;
+    return false;
+  }
+
+  const uint32_t panel = EnsureQuickbarPanel("direct-page-select");
+  if (panel == 0) {
+    errno = ENOENT;
+    return false;
+  }
+
+  typedef void (*QuickbarPageSelectFn)(void*, int32_t);
+  const QuickbarPageSelectFn fn = reinterpret_cast<QuickbarPageSelectFn>(kQuickbarPageSelect);
+  fn(reinterpret_cast<void*>(panel), page_index);
+
+  const int32_t resolved_page = ResolveQuickbarPageIndex(panel);
+  if (out_resolved_page != nullptr) {
+    *out_resolved_page = resolved_page;
+  }
+  if (resolved_page >= 0) {
+    AtomicSet(&g_state.quickbar_page, resolved_page);
+  }
+  if (resolved_page != page_index) {
+    errno = EINVAL;
+    return false;
+  }
+  return true;
+}
+
+int32_t CallQuickbarExecDirect(int32_t slot_index) {
+  if (slot_index < 0 || slot_index >= kQuickbarSlotCount) {
+    errno = EINVAL;
+    return 0;
+  }
+
+  const uint32_t panel = EnsureQuickbarPanel("direct-call");
+  if (panel == 0) {
+    errno = ENOENT;
+    return 0;
+  }
+
+  const uint32_t enabled = SafeReadPointer32(static_cast<uintptr_t>(panel) + kQuickbarEnabledOffset);
+  if (enabled == 0) {
+    errno = EAGAIN;
+    return 0;
+  }
+
+  uint32_t current_page_base = SafeReadPointer32(static_cast<uintptr_t>(panel) + kQuickbarCurrentPageOffset);
+  if (current_page_base == 0) {
+    const int32_t cached_page = static_cast<int32_t>(AtomicGet(&g_state.quickbar_page));
+    if (cached_page >= 0 && cached_page < kQuickbarPageCount) {
+      current_page_base = panel + kQuickbarPanelSlotsOffset + static_cast<uint32_t>(cached_page) * kQuickbarPageStride;
+    }
+  }
+  if (current_page_base == 0) {
+    errno = EINVAL;
+    return 0;
+  }
+
+  const uint32_t slot_ptr = current_page_base + static_cast<uint32_t>(slot_index) * kQuickbarSlotStride;
+  if (!RangeIsMapped(slot_ptr, kQuickbarSlotTypeOffset + 1, false)) {
+    errno = EFAULT;
+    return 0;
+  }
+
+  typedef void (*QuickbarSlotDispatchFn)(void*, void*);
+  const QuickbarSlotDispatchFn fn = reinterpret_cast<QuickbarSlotDispatchFn>(kQuickbarSlotDispatch);
+  fn(reinterpret_cast<void*>(panel), reinterpret_cast<void*>(slot_ptr));
+
+  const int32_t resolved_page = ResolveQuickbarPageIndex(panel);
+  if (resolved_page >= 0) {
+    AtomicSet(&g_state.quickbar_page, resolved_page);
+  }
+  AtomicSet(&g_state.quickbar_slot, slot_index);
+  AtomicSet(&g_state.last_result, 1);
+  AtomicSet(&g_state.last_error, 0);
+  return 1;
+}
+
+int32_t CallQuickbarPageSlotDirect(int32_t page, int32_t slot, int32_t* out_aux_rc, int32_t* out_path) {
+  if (out_aux_rc != nullptr) {
+    *out_aux_rc = -1;
+  }
+  if (out_path != nullptr) {
+    *out_path = 0;
+  }
   if (page < 0 || page >= kQuickbarPageCount || slot < 1 || slot > kQuickbarSlotCount) {
     errno = EINVAL;
     return 0;
   }
-  uint32_t panel = static_cast<uint32_t>(AtomicGet(&g_state.quickbar_this));
-  if (!IsQuickbarPanel(panel)) {
-    DiscoverQuickbarPanel("direct-call");
-    panel = static_cast<uint32_t>(AtomicGet(&g_state.quickbar_this));
-  }
-  if (!IsQuickbarPanel(panel)) {
+
+  const uint32_t panel = EnsureQuickbarPanel("page-slot-trigger");
+  if (panel == 0) {
     errno = ENOENT;
     return 0;
   }
-  typedef void (*QuickbarExecFn)(void*, int32_t);
-  const QuickbarExecFn fn = reinterpret_cast<QuickbarExecFn>(kQuickbarExec);
-  const int32_t linux_slot = page * kQuickbarSlotCount + (slot - 1);
-  fn(reinterpret_cast<void*>(panel), linux_slot);
-  AtomicSet(&g_state.quickbar_slot, slot - 1);
-  AtomicSet(&g_state.quickbar_page, page);
-  AtomicSet(&g_state.last_result, 1);
-  AtomicSet(&g_state.last_error, 0);
-  return 1;
+
+  int32_t original_page = ResolveQuickbarPageIndex(panel);
+  if (original_page < 0) {
+    const int32_t cached_page = static_cast<int32_t>(AtomicGet(&g_state.quickbar_page));
+    if (cached_page >= 0 && cached_page < kQuickbarPageCount) {
+      original_page = cached_page;
+    }
+  }
+  if (out_aux_rc != nullptr) {
+    *out_aux_rc = original_page;
+  }
+
+  const bool restore_needed = original_page >= 0 && original_page != page;
+  if (original_page != page) {
+    if (!CallQuickbarPageSelectDirect(page, nullptr)) {
+      return 0;
+    }
+  }
+
+  const int32_t rc = CallQuickbarExecDirect(slot - 1);
+  const int saved_errno = errno;
+  if (rc != 0 && out_path != nullptr) {
+    *out_path = page == 0 ? 2 : 3;
+  }
+
+  if (rc != 0 && restore_needed) {
+    int32_t restored_page = -1;
+    if (!CallQuickbarPageSelectDirect(original_page, &restored_page)) {
+      return 0;
+    }
+  } else if (rc == 0) {
+    errno = saved_errno;
+  }
+
+  return rc;
 }
 
 int32_t CallChatSendDirect(const char* text, int32_t mode) {
@@ -1653,7 +1796,7 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
       "hook: module=SimKeysHookLinux.so\n"
       "hook: log=%s\n"
       "hook: installed=%d logLevel=%d pipeState=%d pipeErr=%d\n"
-      "expected: quickbarExec=0x%08X slotDispatch=0x%08X quickbarVtable=0x%08X chatSend=0x%08X chatWindowLog=0x%08X\n"
+      "expected: quickbarExec=0x%08X quickbarPageSelect=0x%08X slotDispatch=0x%08X quickbarVtable=0x%08X chatSend=0x%08X chatWindowLog=0x%08X\n"
       "engine: appGlobalSlot=0x%08X appHolder=0x%08X appObject=0x%08X currentObjectId=0x%08X\n"
       "quickbar: execTrace=%d slotTrace=%d capturedThis=0x%08X page=%d capturedSlot=%d slotPtr=0x%08X slotType=%d calls=%d scanAttempts=%d scanHits=%d itemMask=0x%08X%08X equippedMask=0x%08X%08X\n"
       "chat: trace=%d queued=%d nextWrite=%d latestSeq=%d lastMode=%d lastRc=%d lastErr=%d\n"
@@ -1671,6 +1814,7 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
       g_state.pipe_state,
       g_state.pipe_thread_error,
       kQuickbarExec,
+      kQuickbarPageSelect,
       kQuickbarSlotDispatch,
       kQuickbarPanelVtable,
       kChatSend,
@@ -1771,12 +1915,14 @@ void DrainPendingOnMainThread() {
   switch (kind) {
     case kPendingTriggerSlot: {
       const int32_t vk = 0x70 + pending->slot - 1;
+      int32_t aux_rc = -1;
+      int32_t path = 0;
       pending->trigger_response.vk = vk;
-      pending->trigger_response.rc = CallQuickbarExecDirect(pending->page, pending->slot);
+      pending->trigger_response.rc = CallQuickbarPageSlotDirect(pending->page, pending->slot, &aux_rc, &path);
       pending->trigger_response.success = pending->trigger_response.rc ? 1 : 0;
-      pending->trigger_response.aux_rc = 0;
+      pending->trigger_response.aux_rc = aux_rc;
       pending->trigger_response.last_error = pending->trigger_response.success ? 0 : errno;
-      pending->trigger_response.path = 2;
+      pending->trigger_response.path = path;
       AtomicSet(&g_state.last_vk, vk);
       AtomicSet(&g_state.last_result, pending->trigger_response.rc);
       AtomicSet(&g_state.last_error, pending->trigger_response.last_error);

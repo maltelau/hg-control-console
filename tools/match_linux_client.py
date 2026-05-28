@@ -356,7 +356,39 @@ def analyze_linux(image: BinaryImage) -> dict[str, object]:
             "kExpectedQuickbarExec=0x0051FAA0",
             [
                 f"slot-index math pattern at {hex32(quickbar_exec_hit)} computes slot * 0x184 + panel + 0x74",
-                "tail-jumps into quickbar.slot_dispatch",
+                "Linux wrapper calls the slot-reset helper before tail-jumping into quickbar.slot_dispatch",
+            ],
+        )
+    )
+
+    page_select_pattern = (
+        b"\x8A\x45\x0C"
+        b"\x3C\x02"
+        b"\x88\x85\xE7\xFE\xFF\xFF"
+        b"\x0F\x87\xBB\x00\x00\x00"
+        b"\x0F\xB6\xC0"
+        b"\x8D\x14\xC0"
+        b"\x8D\x14\xD0"
+        b"\xC1\xE2\x02"
+        b"\x29\xC2"
+        b"\xC1\xE2\x04"
+    )
+    quickbar_page_select, page_select_hit = find_function_by_pattern(image, page_select_pattern)
+    page_select_required = [
+        quickbar_page_select is not None,
+        quickbar_page_select is not None and has_bytes(image, quickbar_page_select, 0xA0, b"\x8B\x91\x04\x37\x00\x00"),
+        quickbar_page_select is not None and has_bytes(image, quickbar_page_select, 0xA0, b"\x89\x81\x04\x37\x00\x00"),
+    ]
+    targets.append(
+        TargetReport(
+            "quickbar.page_select",
+            status_from(page_select_required),
+            quickbar_page_select,
+            "kExpectedQuickbarPageSelect=0x0051FD10",
+            [
+                f"page-select pattern at {hex32(page_select_hit)} accepts pages 0..2",
+                "current page base is stored at panel+0x3704",
+                "page stride is 0x1230",
             ],
         )
     )
