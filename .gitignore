@@ -34,9 +34,8 @@ src/native/SimKeysHook2/logs/
 src/native/SimKeysHookLinux/libSimKeysHookLinux.so
 data/character_defaults.user.json
 
-# Large reverse-engineering reference dumps stay local only.
-docs/reverse-engineering/decompiles/
-docs/reverse-engineering/notes/
+# Reverse-engineering notes and reference dumps stay local only.
+docs/reverse-engineering/
 
 # Third-party/reference copies stay local only.
 Hgx.Client/
