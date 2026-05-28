@@ -1,5 +1,4 @@
 import ctypes as C
-import ctypes.wintypes as W
 import os
 import re
 import struct
@@ -11,7 +10,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from . import inject_simkeys
+IS_WINDOWS = os.name == "nt"
+if IS_WINDOWS:
+    import ctypes.wintypes as W
+    from . import inject_simkeys
+else:
+    W = None
+    inject_simkeys = None
 from . import simKeys_Client as simkeys
 
 
@@ -19,9 +24,10 @@ TH32CS_SNAPPROCESS = 0x00000002
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 MAX_PATH = 260
 INVALID_HANDLE_VALUE = C.c_void_p(-1).value
+DWORD = W.DWORD if IS_WINDOWS else C.c_uint32
 
-k32 = C.WinDLL("kernel32", use_last_error=True)
-u32 = C.WinDLL("user32", use_last_error=True)
+k32 = C.WinDLL("kernel32", use_last_error=True) if IS_WINDOWS else None
+u32 = C.WinDLL("user32", use_last_error=True) if IS_WINDOWS else None
 _PIPE_LOCKS: Dict[int, threading.RLock] = {}
 _PIPE_LOCKS_GUARD = threading.Lock()
 
@@ -62,8 +68,8 @@ def _get_pipe_lock(pid: int):
 
 class FILETIME(C.Structure):
     _fields_ = [
-        ("dwLowDateTime", W.DWORD),
-        ("dwHighDateTime", W.DWORD),
+        ("dwLowDateTime", DWORD),
+        ("dwHighDateTime", DWORD),
     ]
 
 
@@ -128,6 +134,8 @@ def filetime_to_ticks(ft: FILETIME) -> int:
 def ticks_to_text(ticks: int) -> str:
     if ticks <= 0:
         return "unknown"
+    if not IS_WINDOWS:
+        return datetime.fromtimestamp(ticks).strftime("%Y-%m-%d %H:%M:%S")
     unix_seconds = (ticks - 116444736000000000) / 10000000.0
     return datetime.fromtimestamp(unix_seconds).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -148,7 +156,19 @@ def package_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def default_process_name() -> str:
+    return "nwmain.exe" if IS_WINDOWS else "nwmain"
+
+
 def default_dll_path() -> str:
+    if not IS_WINDOWS:
+        bundled_so = os.path.join(root_dir(), "bin", "libSimKeysHookLinux.so")
+        release_so = os.path.join(root_dir(), "src", "native", "SimKeysHookLinux", "libSimKeysHookLinux.so")
+        candidates = [path for path in (bundled_so, release_so) if os.path.isfile(path)]
+        if candidates:
+            return max(candidates, key=lambda path: os.path.getmtime(path))
+        return release_so
+
     bundled_dll = os.path.join(root_dir(), "bin", "SimKeysHook2.dll")
     release_dll = os.path.join(root_dir(), "src", "native", "SimKeysHook2", "Release", "SimKeysHook2.dll")
     candidates = [path for path in (bundled_dll, release_dll) if os.path.isfile(path)]
@@ -251,7 +271,89 @@ def resolve_python_interpreter(preferred_path: Optional[str] = None, require_x86
     raise RuntimeError("Could not find a usable Python interpreter.")
 
 
+def _read_proc_text(pid: int, name: str) -> str:
+    try:
+        with open(os.path.join("/proc", str(pid), name), "rb") as handle:
+            return handle.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _linux_process_matches(pid: int, process_name: str) -> bool:
+    target = (process_name or "nwmain").lower()
+    targets = {target}
+    if target.endswith(".exe"):
+        targets.add(target[:-4])
+
+    comm = _read_proc_text(pid, "comm").strip().lower()
+    if comm in targets:
+        return True
+
+    cmdline = _read_proc_text(pid, "cmdline").replace("\x00", "\n").splitlines()
+    if cmdline:
+        exe_name = os.path.basename(cmdline[0]).lower()
+        if exe_name in targets:
+            return True
+
+    try:
+        exe_name = os.path.basename(os.readlink(os.path.join("/proc", str(pid), "exe"))).lower()
+        if exe_name in targets:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _linux_boot_time() -> int:
+    try:
+        with open("/proc/stat", "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except Exception:
+        return 0
+    return 0
+
+
+def _linux_process_start_epoch(pid: int) -> int:
+    stat = _read_proc_text(pid, "stat")
+    if not stat:
+        return 0
+    close = stat.rfind(")")
+    if close < 0:
+        return 0
+    fields = stat[close + 2:].split()
+    if len(fields) <= 19:
+        return 0
+    try:
+        start_ticks = int(fields[19])
+        hertz = os.sysconf("SC_CLK_TCK")
+        boot = _linux_boot_time()
+        if boot <= 0 or hertz <= 0:
+            return 0
+        return int(boot + (start_ticks / hertz))
+    except Exception:
+        return 0
+
+
+def _linux_process_title(pid: int) -> str:
+    cmdline = _read_proc_text(pid, "cmdline").replace("\x00", " ").strip()
+    if cmdline:
+        return cmdline
+    return _read_proc_text(pid, "comm").strip()
+
+
 def enumerate_nwmain_pids(process_name: str = "nwmain.exe") -> List[int]:
+    if not IS_WINDOWS:
+        pids = []
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            if _linux_process_matches(pid, process_name):
+                pids.append(pid)
+        return sorted(pids)
+
     k32.CreateToolhelp32Snapshot.argtypes = [W.DWORD, W.DWORD]
     k32.CreateToolhelp32Snapshot.restype = W.HANDLE
     k32.Process32FirstW.argtypes = [W.HANDLE, C.POINTER(PROCESSENTRY32W)]
@@ -281,6 +383,9 @@ def enumerate_nwmain_pids(process_name: str = "nwmain.exe") -> List[int]:
 
 
 def get_process_creation_ticks(pid: int) -> int:
+    if not IS_WINDOWS:
+        return _linux_process_start_epoch(pid)
+
     k32.OpenProcess.argtypes = [W.DWORD, W.BOOL, W.DWORD]
     k32.OpenProcess.restype = W.HANDLE
     k32.GetProcessTimes.argtypes = [
@@ -311,6 +416,15 @@ def get_process_creation_ticks(pid: int) -> int:
 
 
 def get_window_info(pid: int):
+    if not IS_WINDOWS:
+        return {
+            "hwnd": 0,
+            "thread_id": 0,
+            "title": _linux_process_title(pid),
+            "class_name": "nwmain",
+            "visible": False,
+        }
+
     u32.EnumWindows.argtypes = [C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM), W.LPARAM]
     u32.EnumWindows.restype = W.BOOL
     u32.GetWindowThreadProcessId.argtypes = [W.HWND, C.POINTER(W.DWORD)]
@@ -425,7 +539,9 @@ def probe_client(pid: int, pipe_timeout_ms: int = 125) -> ClientRecord:
     )
 
 
-def discover_clients(process_name: str = "nwmain.exe", pipe_timeout_ms: int = 125) -> List[ClientRecord]:
+def discover_clients(process_name: str = None, pipe_timeout_ms: int = 125) -> List[ClientRecord]:
+    if process_name is None:
+        process_name = default_process_name()
     records = [probe_client(pid, pipe_timeout_ms=pipe_timeout_ms) for pid in enumerate_nwmain_pids(process_name)]
     records.sort(key=lambda item: (item.created_ticks or (1 << 63), item.pid))
     for index, record in enumerate(records, start=1):
@@ -649,6 +765,14 @@ def clear_all_overlays(record_or_pid):
 
 
 def inject_client(record: ClientRecord, dll_path: str, export_name: str = "InitSimKeys", python_path: Optional[str] = None):
+    if not IS_WINDOWS:
+        if record.injected:
+            return 0, 0
+        raise RuntimeError(
+            "Linux clients must be launched with the HGCC preload hook. "
+            "Use src/simkeys_app/launch_linux_client.py or simkeys_linux_client.sh so nwmain starts with LD_PRELOAD."
+        )
+
     dll_path = os.path.abspath(dll_path)
     if python_path is None or os.path.abspath(python_path).lower() == os.path.abspath(sys.executable).lower():
         return inject_simkeys.inject_and_init(record.pid, dll_path, export_name)

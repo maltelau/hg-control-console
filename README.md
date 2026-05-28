@@ -1,6 +1,6 @@
 # HG Control Console
 
-HG Control Console (HGCC) is a Windows control and automation toolkit for **Neverwinter Nights Diamond** clients running on the **Higher Ground** server. It controls NWN clients without requiring foreground focus by injecting a small native hook into each `nwmain.exe` process and exposing a per-client named pipe to the Python GUI.
+HG Control Console (HGCC) is a control and automation toolkit for **Neverwinter Nights Diamond** clients running on the **Higher Ground** server. On Windows it injects a small native hook into each `nwmain.exe` process and exposes a per-client named pipe to the Python GUI. On Linux it launches the 32-bit 1.69 client with an `LD_PRELOAD` hook and exposes the same HGCC protocol over a Unix socket.
 
 The project is aimed at multi-client play, combat automation, damage analysis, and Higher Ground quality-of-life workflows. Each injected client exposes a named pipe that HGCC uses for quickbar activation, chat sending and capture, overlays, player identity, and quickbar state.
 
@@ -11,7 +11,7 @@ The project is aimed at multi-client play, combat automation, damage analysis, a
 
 ## Features
 
-- Discover and inject running `nwmain.exe` clients.
+- Discover and inject running Windows `nwmain.exe` clients, or discover Linux clients launched with the HGCC preload hook.
 - Trigger Base, Shift, and Ctrl quickbar slots through NWN quickbar functions.
 - Send chat and HG commands through injected clients without focusing them.
 - Capture rendered chat/log lines and route them to automation scripts.
@@ -36,21 +36,53 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\simkeys_gui.ps1
 
 The GUI launcher requests administrator access if needed.
 
+## Linux Client Support
+
+Linux support targets the 32-bit NWN 1.69 Linux client. Build the preload hook, then start the game through the launcher:
+
+```bash
+./src/native/SimKeysHookLinux/build.sh
+./simkeys_linux_client.sh --client-dir /path/to/English_linuxclient_xp2
+```
+
+From Windows, the same hook can be cross-compiled with Zig:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\src\native\SimKeysHookLinux\build.ps1
+```
+
+To prepare a WSL test distro, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\setup_linux_test_env.ps1 -InstallWsl -Bootstrap
+```
+
+This may prompt for administrator approval and a restart because it installs WSL/Ubuntu 24.04 when they are missing.
+For Google Drive or mapped-drive checkouts, stage the repo and Linux client on `C:` first, for example under `C:\CodexWSL\NWN`. The WSL helper refuses to mount non-system drives by default; pass `-Repo` and `-ClientDir` pointing at the staged `C:` copies.
+
+The old Diamond Linux client also needs the bundled compatibility libraries from a complete Linux/Diamond install. The classic install order is Gold Linux client, HOTU Linux client, then the 1.69 XP2 Linux client, followed by `./fixinstall`. In that layered tree, `libmss.so.6` lives under `miles`, and the old `nwn` wrapper also prepends `lib` for its bundled SDL. The HGCC launcher mirrors that behavior by adding `lib`, `miles_linux`, `miles`, and the client directory to `LD_LIBRARY_PATH` when present, and by setting the same SDL mouse compatibility flags. If `ldd nwmain` reports `libmss.so.6 => not found`, copy the missing `miles`/`miles_linux` folder from a complete Linux/Diamond install before launching.
+
+Then run the Python GUI on the same Linux session and it will discover `nwmain` clients through `simkeys_<pid>.sock`.
+
+The Linux hook provides the same HGCC operations as the Windows hook: quickbar slots, chat send/capture, overlays, player identity, position, movement, walk bypass, and action-mode toggles. Already-running Linux clients are not injected; launch them with `simkeys_linux_client.sh`.
+
 ## Requirements
 
-- Windows.
-- Neverwinter Nights Diamond, using the 32-bit `nwmain.exe` client.
+- Windows with Neverwinter Nights Diamond using the 32-bit `nwmain.exe` client, or Linux with the 32-bit NWN 1.69 `nwmain` client.
 - Python for the GUI and injector scripts. The launcher looks for `python`, the `py` launcher, and common Python 3.11-3.13 install locations.
 - Visual Studio 2022 Build Tools with the C++ workload only if rebuilding `SimKeysHook2.dll`.
+- On Linux, a 32-bit C++ toolchain is required only when rebuilding `libSimKeysHookLinux.so`. On Windows, Zig can cross-compile the Linux hook.
 
 The repository includes a prebuilt 32-bit hook DLL at `bin\SimKeysHook2.dll`, so Visual Studio is not required for normal use.
 
 ## Files
 
 - `simkeys_gui.ps1`: desktop GUI launcher.
+- `simkeys_linux_client.sh`: Linux client launcher that sets `LD_PRELOAD` for `nwmain`.
 - `bin/SimKeysHook2.dll`: bundled native hook DLL.
 - `src/simkeys_app/`: Python GUI, injector, runtime helpers, damage meter, and script host.
 - `src/native/SimKeysHook2/`: native hook source and build wrapper.
+- `src/native/SimKeysHookLinux/`: Linux preload hook source and build wrapper.
 - `data/characters.d/`: Higher Ground creature data.
 - `data/followcues.d/`: Always On follow cues.
 - `data/statusrules.d/`: In-Game Timers rules.
@@ -290,7 +322,7 @@ The native hook also writes process-specific diagnostic logs under the runtime l
 
 ## Rebuilding The Native Hook
 
-Normal users do not need to rebuild the hook. To rebuild it, install Visual Studio 2022 Build Tools with the C++ workload, then run:
+Normal users do not need to rebuild the hook. To rebuild the Windows hook, install Visual Studio 2022 Build Tools with the C++ workload, then run:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\src\native\SimKeysHook2\build.ps1
@@ -303,14 +335,34 @@ The build wrapper:
 3. Writes build output under `src\native\SimKeysHook2\Release\`.
 4. Copies the rebuilt DLL to `bin\SimKeysHook2.dll`.
 
-## Low-Level Pipe Client
+To rebuild the Linux preload hook from Windows, install Zig, then run:
 
-`src\simkeys_app\simKeys_Client.py` is the lower-level pipe client used by the runtime helpers. It can query state, trigger slots, send chat, poll chat, and show or clear overlays when given a PID. It is mainly useful for debugging hook behavior.
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\src\native\SimKeysHookLinux\build.ps1
+```
 
-The compatibility pipe name is:
+On Linux, run:
+
+```bash
+./src/native/SimKeysHookLinux/build.sh
+```
+
+The Linux build writes `src\native\SimKeysHookLinux\libSimKeysHookLinux.so` and copies the runtime hook to `bin\libSimKeysHookLinux.so`. It dynamically resolves the OpenGL/X11 functions already loaded by the game client, so the build only links against libc, `dl`, and pthread.
+
+## Low-Level Protocol Client
+
+`src\simkeys_app\simKeys_Client.py` is the lower-level protocol client used by the runtime helpers. It can query state, trigger slots, send chat, poll chat, and show or clear overlays when given a PID. It uses a Windows named pipe on Windows and a Unix socket on Linux. It is mainly useful for debugging hook behavior.
+
+The Windows compatibility pipe name is:
 
 ```text
 \\.\pipe\simkeys_<pid>
+```
+
+The Linux socket name is:
+
+```text
+$SIMKEYS_LINUX_SOCKET_DIR/simkeys_<pid>.sock
 ```
 
 ## Notes

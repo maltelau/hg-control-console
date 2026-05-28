@@ -2711,7 +2711,7 @@ class SimKeysDesktopApp:
         def action():
             records = runtime.discover_clients(process_name=self.args.process_name)
             if not records:
-                raise RuntimeError("No nwmain.exe clients are running.")
+                raise RuntimeError(f"No {runtime.default_process_name()} clients are running.")
             target = runtime.find_uninjected_client(records)
             if target is None:
                 return "All discovered NWN clients are already injected."
@@ -2729,7 +2729,7 @@ class SimKeysDesktopApp:
         def action():
             records = runtime.discover_clients(process_name=self.args.process_name)
             if not records:
-                raise RuntimeError("No nwmain.exe clients are running.")
+                raise RuntimeError(f"No {runtime.default_process_name()} clients are running.")
             targets = [record for record in records if not record.injected]
             if not targets:
                 return "All discovered NWN clients are already injected."
@@ -3056,7 +3056,7 @@ class SimKeysDesktopApp:
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Desktop HGCC control client.")
-    parser.add_argument("--process-name", default="nwmain.exe", help="Process image name to discover. Default: nwmain.exe")
+    parser.add_argument("--process-name", default=runtime.default_process_name(), help=f"Process image name to discover. Default: {runtime.default_process_name()}")
     parser.add_argument("--dll", default=runtime.default_dll_path())
     parser.add_argument("--export", default="InitSimKeys")
     parser.add_argument("--inject-python", help="Optional alternate Python interpreter to use for injection.")

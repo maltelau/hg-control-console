@@ -13,11 +13,16 @@
 #   move-to-location X Y Z -> call the in-game move-to-position function directly
 #   set-action-mode M -> call the in-game SetMode/action-mode path directly
 
-import argparse, struct, time
+import argparse, errno, os, socket, struct, time
 import ctypes as C
-import ctypes.wintypes as W
 
-k32 = C.WinDLL("kernel32", use_last_error=True)
+IS_WINDOWS = os.name == "nt"
+if IS_WINDOWS:
+    import ctypes.wintypes as W
+    k32 = C.WinDLL("kernel32", use_last_error=True)
+else:
+    W = None
+    k32 = None
 INVALID_HANDLE_VALUE = C.c_void_p(-1).value
 CHAR_NAME_CAPACITY = 128
 ERROR_SUCCESS = 0
@@ -40,11 +45,29 @@ RETRYABLE_PIPE_OPEN_ERRORS = {
 
 def winerr(prefix, err=None):
     if err is None:
-        err = C.get_last_error()
-    message = C.FormatError(err).strip() if err else "no last-error information"
+        err = C.get_last_error() if IS_WINDOWS else C.get_errno()
+    if IS_WINDOWS and err:
+        message = C.FormatError(err).strip()
+    elif err:
+        message = os.strerror(err)
+    else:
+        message = "no last-error information"
     return f"{prefix} (err={err}: {message})"
 
-class Pipe:
+def default_linux_socket_dir():
+    explicit = os.environ.get("SIMKEYS_LINUX_SOCKET_DIR")
+    if explicit:
+        return explicit
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir:
+        return os.path.join(runtime_dir, "hgcc")
+    uid = os.getuid() if hasattr(os, "getuid") else os.getpid()
+    return f"/tmp/hgcc-{uid}"
+
+def linux_socket_path(pid):
+    return os.path.join(default_linux_socket_dir(), f"simkeys_{int(pid)}.sock")
+
+class WindowsPipe:
     def __init__(self, pid, timeout_ms=2000):
         self.path = r"\\.\pipe\simkeys_%d" % pid
         self.C, self.W = C, W
@@ -131,6 +154,70 @@ class Pipe:
             self.close()
         except Exception:
             pass
+
+class UnixSocketPipe:
+    def __init__(self, pid, timeout_ms=2000, path=None):
+        self.path = path or linux_socket_path(pid)
+        self.sock = self._open_with_retry(timeout_ms)
+
+    def _open_with_retry(self, timeout_ms):
+        timeout_ms = max(int(timeout_ms), 0)
+        deadline = time.monotonic() + (timeout_ms / 1000.0)
+        retryable = {
+            errno.ENOENT,
+            errno.ECONNREFUSED,
+            errno.EACCES,
+            errno.EAGAIN,
+            errno.EWOULDBLOCK,
+        }
+        last_error = 0
+        while True:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(max(timeout_ms / 1000.0, 0.001) if timeout_ms else None)
+            try:
+                sock.connect(self.path)
+                sock.settimeout(None)
+                return sock
+            except OSError as exc:
+                last_error = exc.errno or 0
+                sock.close()
+                if last_error not in retryable or time.monotonic() >= deadline:
+                    break
+                time.sleep(min(0.025, max(deadline - time.monotonic(), 0.0)))
+        raise OSError(winerr(f"Could not open HGCC socket after {timeout_ms} ms: {self.path}", last_error))
+
+    def _write(self, data):
+        self.sock.sendall(data)
+
+    def _read(self, nbytes):
+        chunks = bytearray()
+        while len(chunks) < nbytes:
+            chunk = self.sock.recv(nbytes - len(chunks))
+            if not chunk:
+                raise OSError(f"Socket closed while reading {self.path}")
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    def xfer(self, opcode, payload=b""):
+        hdr = struct.pack("II", opcode, len(payload))
+        self._write(hdr + payload)
+        op, sz = struct.unpack("II", self._read(8))
+        data = self._read(sz) if sz else b""
+        return op, data
+
+    def close(self):
+        sock = getattr(self, "sock", None)
+        if sock is not None:
+            self.sock = None
+            sock.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+Pipe = WindowsPipe if IS_WINDOWS else UnixSocketPipe
 
 OP_QUERY=3000; OP_SLOT=3001; OP_VK=3002; OP_SETLOG=3003; OP_REPLAY=3004; OP_SNAPSHOT=3005; OP_CHAT_SEND=3006; OP_CHAT_POLL=3007; OP_SLOT_PAGE=3008; OP_OVERLAY_TEXT=3009; OP_OVERLAY_CLEAR=3010; OP_OVERLAY_CLEAR_ALL=3011; OP_MOVE_TO_LOCATION=3012; OP_SET_WALK_BYPASS=3013; OP_SET_ACTION_MODE=3014
 QUERY_STRUCT_LEGACY = struct.Struct("<" + ("I" * 24) + ("i" * 10) + "I" + ("i" * 2) + ("I" * 4) + f"{CHAR_NAME_CAPACITY}s")

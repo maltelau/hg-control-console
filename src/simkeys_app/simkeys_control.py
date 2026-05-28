@@ -12,16 +12,23 @@ def default_dll_path():
     return runtime.default_dll_path()
 
 
+def default_process_name():
+    return runtime.default_process_name()
+
+
 def print_clients(records):
     if not records:
-        print("No nwmain.exe clients are running.")
+        print(f"No {default_process_name()} clients are running.")
         return
     for record in records:
         print(runtime.format_client_line(record))
 
 
 def discover_records(args):
-    return runtime.discover_clients(process_name=f"{args.process_name}.exe" if not args.process_name.lower().endswith(".exe") else args.process_name)
+    process_name = args.process_name
+    if runtime.IS_WINDOWS and not process_name.lower().endswith(".exe"):
+        process_name = f"{process_name}.exe"
+    return runtime.discover_clients(process_name=process_name)
 
 
 def cmd_list(args):
@@ -32,7 +39,7 @@ def cmd_list(args):
 def cmd_inject_next(args):
     records = discover_records(args)
     if not records:
-        print("No nwmain.exe clients are running.")
+        print(f"No {default_process_name()} clients are running.")
         return 1
     target = runtime.find_uninjected_client(records, skip=max(args.skip, 0))
     if target is None:
@@ -47,7 +54,7 @@ def cmd_inject_next(args):
 def cmd_inject_all(args):
     records = discover_records(args)
     if not records:
-        print("No nwmain.exe clients are running.")
+        print(f"No {default_process_name()} clients are running.")
         return 1
     targets = [record for record in records if not record.injected]
     if not targets:
@@ -186,7 +193,7 @@ def cmd_watch_chat(args):
 
 def build_parser():
     ap = argparse.ArgumentParser(description="Central HGCC controller for multi-client NWN injection and control.")
-    ap.add_argument("--process-name", default="nwmain", help="Process image name to discover. Default: nwmain")
+    ap.add_argument("--process-name", default=default_process_name(), help=f"Process image name to discover. Default: {default_process_name()}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("list", help="List discovered NWN clients and whether each is injected.")

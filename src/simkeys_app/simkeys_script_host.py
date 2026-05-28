@@ -3,8 +3,8 @@ import threading
 import time
 import math
 import ctypes as C
-import ctypes.wintypes as W
 import re
+import struct
 import weakref
 from xml.etree import ElementTree as ET
 from copy import deepcopy
@@ -17,17 +17,24 @@ from . import simkeys_hgx_combat as hgx_combat
 from . import simkeys_hgx_data as hgx_data
 from . import simkeys_runtime as runtime
 
+IS_WINDOWS = os.name == "nt"
+if IS_WINDOWS:
+    import ctypes.wintypes as W
+else:
+    W = None
+
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_READ = 0x0010
 INVALID_HANDLE_VALUE = C.c_void_p(-1).value
 
-_kernel32 = C.WinDLL("kernel32", use_last_error=True)
-_kernel32.OpenProcess.argtypes = [W.DWORD, W.BOOL, W.DWORD]
-_kernel32.OpenProcess.restype = W.HANDLE
-_kernel32.CloseHandle.argtypes = [W.HANDLE]
-_kernel32.CloseHandle.restype = W.BOOL
-_kernel32.ReadProcessMemory.argtypes = [W.HANDLE, W.LPCVOID, W.LPVOID, C.c_size_t, C.POINTER(C.c_size_t)]
-_kernel32.ReadProcessMemory.restype = W.BOOL
+_kernel32 = C.WinDLL("kernel32", use_last_error=True) if IS_WINDOWS else None
+if IS_WINDOWS:
+    _kernel32.OpenProcess.argtypes = [W.DWORD, W.BOOL, W.DWORD]
+    _kernel32.OpenProcess.restype = W.HANDLE
+    _kernel32.CloseHandle.argtypes = [W.HANDLE]
+    _kernel32.CloseHandle.restype = W.BOOL
+    _kernel32.ReadProcessMemory.argtypes = [W.HANDLE, W.LPCVOID, W.LPVOID, C.c_size_t, C.POINTER(C.c_size_t)]
+    _kernel32.ReadProcessMemory.restype = W.BOOL
 
 kLegacyImageBase = 0x00400000
 kLegacyHpPointerOffset = 0x0053165C
@@ -35,6 +42,7 @@ kLegacyClientDefensiveCastingModeOffset = 0x184
 kLegacyHpOwnerOffset = 0x2B8
 kLegacyCurrentHpOffset = 0x4C
 kLegacyMaxHpProbeOffsets = (2, 4, 6, 8, 0xA, 0xC, 0xE, 0x10)
+kLinuxCreatureDefensiveCastingModeOffset = 0x4AE
 
 WEAPON_SLOT_NONE = "-"
 WEAPON_CURRENT_UNKNOWN = "Unknown"
@@ -1221,13 +1229,26 @@ class AutoDrinkScript(ClientScriptBase):
 
     def _close_process_handle(self):
         handle = self.process_handle
-        if handle not in (None, 0, INVALID_HANDLE_VALUE):
+        if IS_WINDOWS and _kernel32 is not None and handle not in (None, 0, INVALID_HANDLE_VALUE):
             _kernel32.CloseHandle(handle)
+        elif not IS_WINDOWS and handle not in (None, 0, INVALID_HANDLE_VALUE):
+            try:
+                os.close(handle)
+            except OSError:
+                pass
         self.process_handle = None
 
     def _ensure_process_handle(self):
         handle = self.process_handle
         if handle not in (None, 0, INVALID_HANDLE_VALUE):
+            return handle
+
+        if not IS_WINDOWS:
+            try:
+                handle = os.open(f"/proc/{int(self.client.pid)}/mem", os.O_RDONLY)
+            except OSError as exc:
+                raise OSError(f"Open /proc/{int(self.client.pid)}/mem failed: {exc}") from exc
+            self.process_handle = handle
             return handle
 
         handle = _kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, int(self.client.pid))
@@ -1238,6 +1259,11 @@ class AutoDrinkScript(ClientScriptBase):
 
     def _read_u32(self, address: int) -> int:
         handle = self._ensure_process_handle()
+        if not IS_WINDOWS:
+            data = os.pread(handle, 4, int(address))
+            if len(data) != 4:
+                raise OSError(f"pread(u32, 0x{address:08X}) returned {len(data)} bytes")
+            return struct.unpack("<I", data)[0]
         value = C.c_uint32()
         size = C.c_size_t()
         if not _kernel32.ReadProcessMemory(handle, W.LPCVOID(address), C.byref(value), C.sizeof(value), C.byref(size)):
@@ -1246,6 +1272,11 @@ class AutoDrinkScript(ClientScriptBase):
 
     def _read_u16(self, address: int) -> int:
         handle = self._ensure_process_handle()
+        if not IS_WINDOWS:
+            data = os.pread(handle, 2, int(address))
+            if len(data) != 2:
+                raise OSError(f"pread(u16, 0x{address:08X}) returned {len(data)} bytes")
+            return struct.unpack("<H", data)[0]
         value = C.c_uint16()
         size = C.c_size_t()
         if not _kernel32.ReadProcessMemory(handle, W.LPCVOID(address), C.byref(value), C.sizeof(value), C.byref(size)):
@@ -7297,13 +7328,26 @@ class AutoCombatModeScript(ClientScriptBase):
 
     def _close_process_handle(self):
         handle = self.process_handle
-        if handle not in (None, 0, INVALID_HANDLE_VALUE):
+        if IS_WINDOWS and _kernel32 is not None and handle not in (None, 0, INVALID_HANDLE_VALUE):
             _kernel32.CloseHandle(handle)
+        elif not IS_WINDOWS and handle not in (None, 0, INVALID_HANDLE_VALUE):
+            try:
+                os.close(handle)
+            except OSError:
+                pass
         self.process_handle = None
 
     def _ensure_process_handle(self):
         handle = self.process_handle
         if handle not in (None, 0, INVALID_HANDLE_VALUE):
+            return handle
+
+        if not IS_WINDOWS:
+            try:
+                handle = os.open(f"/proc/{int(self.client.pid)}/mem", os.O_RDONLY)
+            except OSError as exc:
+                raise OSError(f"Open /proc/{int(self.client.pid)}/mem failed: {exc}") from exc
+            self.process_handle = handle
             return handle
 
         handle = _kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, int(self.client.pid))
@@ -7314,6 +7358,11 @@ class AutoCombatModeScript(ClientScriptBase):
 
     def _read_u32(self, address: int) -> int:
         handle = self._ensure_process_handle()
+        if not IS_WINDOWS:
+            data = os.pread(handle, 4, int(address))
+            if len(data) != 4:
+                raise OSError(f"pread(u32, 0x{address:08X}) returned {len(data)} bytes")
+            return struct.unpack("<I", data)[0]
         value = C.c_uint32()
         size = C.c_size_t()
         if not _kernel32.ReadProcessMemory(handle, W.LPCVOID(address), C.byref(value), C.sizeof(value), C.byref(size)):
@@ -7322,6 +7371,11 @@ class AutoCombatModeScript(ClientScriptBase):
 
     def _read_u8(self, address: int) -> int:
         handle = self._ensure_process_handle()
+        if not IS_WINDOWS:
+            data = os.pread(handle, 1, int(address))
+            if len(data) != 1:
+                raise OSError(f"pread(u8, 0x{address:08X}) returned {len(data)} bytes")
+            return data[0]
         value = C.c_ubyte()
         size = C.c_size_t()
         if not _kernel32.ReadProcessMemory(handle, W.LPCVOID(address), C.byref(value), C.sizeof(value), C.byref(size)):
@@ -7353,6 +7407,30 @@ class AutoCombatModeScript(ClientScriptBase):
         if self.defensive_casting_address:
             return self.defensive_casting_address
 
+        if not IS_WINDOWS:
+            try:
+                state = self.host.query_state()
+            except Exception:
+                state = {}
+            player_object = int(state.get("player_object", 0) or 0)
+            creature = int(state.get("player_creature", 0) or 0)
+            if creature == 0:
+                raise RuntimeError("Defensive Casting creature pointer is not available from the Linux hook yet")
+            module_base = int(state.get("module_base", 0) or (self.client.query or {}).get("module_base", 0) or 0)
+            self.defensive_casting_player_object = player_object
+            self.defensive_casting_creature = creature
+            self.defensive_casting_address = creature + kLinuxCreatureDefensiveCastingModeOffset
+            self.host.emit(
+                "info",
+                (
+                    f"{self.client.display_name}: Defensive Casting path resolved module=0x{module_base:08X} "
+                    f"source=linux-identity clientPlayer=0x{player_object:08X} creature=0x{creature:08X} "
+                    f"state=0x{self.defensive_casting_address:08X}"
+                ),
+                script_id=self.script_id,
+            )
+            return self.defensive_casting_address
+
         module_base = 0
         pointer_source = "identity"
         try:
@@ -7380,6 +7458,8 @@ class AutoCombatModeScript(ClientScriptBase):
         return self.defensive_casting_address
 
     def _read_defensive_casting_status(self) -> int:
+        if not IS_WINDOWS:
+            return self._read_u8(self._resolve_defensive_casting_address())
         return self._read_u32(self._resolve_defensive_casting_address())
 
     def _resolve_legacy_player_pointer(self, label: str) -> Tuple[int, int, int]:
