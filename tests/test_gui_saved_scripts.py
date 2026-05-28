@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from src.simkeys_app import simkeys_gui
 from src.simkeys_app.simkeys_gui import SimKeysDesktopApp
-from src.simkeys_app.simkeys_script_host import ScriptManager
+from src.simkeys_app.simkeys_script_host import ClientScriptHost, CoordinateFollowScript, ScriptManager
 
 
 def make_persistence_app(path):
@@ -108,6 +108,15 @@ class GuiSavedScriptsTests(unittest.TestCase):
 
         self.assertNotIn("current_weapon", config)
 
+    def test_coordinate_follow_default_timing_is_perf_tuned(self):
+        manager = ScriptManager(lambda _event: None)
+        config = manager.default_config("coordinate_follow")
+
+        self.assertEqual(config["follow_interval_seconds"], CoordinateFollowScript.DEFAULT_FOLLOW_INTERVAL_SECONDS)
+        self.assertEqual(config["position_poll_interval"], CoordinateFollowScript.DEFAULT_POSITION_POLL_INTERVAL)
+        self.assertEqual(config["poll_interval"], CoordinateFollowScript.DEFAULT_POLL_INTERVAL)
+        self.assertEqual(ClientScriptHost.DAMAGE_METER_POLL_INTERVAL, 0.20)
+
     def test_legacy_auto_damage_current_weapon_is_removed_from_saved_defaults(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "character_defaults.user.json")
@@ -189,6 +198,74 @@ class GuiSavedScriptsTests(unittest.TestCase):
             self.assertTrue(app._auto_load_character_defaults(record))
 
             self.assertGreaterEqual(app.get_script_config(202, "ingame_timers")["offset_y"], 88)
+
+    def test_legacy_coordinate_follow_timing_defaults_are_migrated(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "character_defaults.user.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    """{
+  "version": 5,
+  "characters": {
+    "starcore-bob": {
+      "name": "Starcore-Bob",
+      "scripts": {
+        "coordinate_follow": {
+          "role": "Follower",
+          "follow_interval_seconds": 0.5,
+          "position_poll_interval": 0.25,
+          "poll_interval": 0.05
+        }
+      }
+    }
+  }
+}
+"""
+                )
+            app = make_persistence_app(path)
+
+            app._load_character_defaults_store()
+            record = SimpleNamespace(pid=202, character_name="Starcore-Bob", display_name="Starcore-Bob")
+            self.assertTrue(app._auto_load_character_defaults(record))
+
+            config = app.get_script_config(202, "coordinate_follow")
+            self.assertEqual(config["follow_interval_seconds"], CoordinateFollowScript.DEFAULT_FOLLOW_INTERVAL_SECONDS)
+            self.assertEqual(config["position_poll_interval"], CoordinateFollowScript.DEFAULT_POSITION_POLL_INTERVAL)
+            self.assertEqual(config["poll_interval"], CoordinateFollowScript.DEFAULT_POLL_INTERVAL)
+
+    def test_custom_coordinate_follow_timing_survives_migration(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "character_defaults.user.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    """{
+  "version": 5,
+  "characters": {
+    "starcore-bob": {
+      "name": "Starcore-Bob",
+      "scripts": {
+        "coordinate_follow": {
+          "role": "Follower",
+          "follow_interval_seconds": 2.0,
+          "position_poll_interval": 1.5,
+          "poll_interval": 0.3
+        }
+      }
+    }
+  }
+}
+"""
+                )
+            app = make_persistence_app(path)
+
+            app._load_character_defaults_store()
+            record = SimpleNamespace(pid=202, character_name="Starcore-Bob", display_name="Starcore-Bob")
+            self.assertTrue(app._auto_load_character_defaults(record))
+
+            config = app.get_script_config(202, "coordinate_follow")
+            self.assertEqual(config["follow_interval_seconds"], 2.0)
+            self.assertEqual(config["position_poll_interval"], 1.5)
+            self.assertEqual(config["poll_interval"], 0.3)
 
     def test_coordinate_follow_lead_is_singleton_and_disables_basic_follow(self):
         with tempfile.TemporaryDirectory() as tmpdir:

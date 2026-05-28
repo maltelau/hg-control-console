@@ -24,6 +24,7 @@ from .simkeys_script_host import (
 BASIC_FUNCTIONS_SCRIPT_ID = "always_on"
 COORDINATE_FOLLOW_SCRIPT_ID = "coordinate_follow"
 TIMERS_SCRIPT_ID = "ingame_timers"
+CHARACTER_DEFAULTS_VERSION = 6
 DEFAULT_AUTO_START_SCRIPT_IDS = (BASIC_FUNCTIONS_SCRIPT_ID, TIMERS_SCRIPT_ID)
 CLIENT_PANE_DEFAULT_WIDTH = 430
 CLIENT_PANE_MIN_WIDTH = 360
@@ -1274,12 +1275,17 @@ class SimKeysDesktopApp:
     def _clean_script_config(self, script_id, config):
         if script_id not in self.script_manager.registry or not isinstance(config, dict):
             return {}
-        allowed = set(self.script_manager.default_config(script_id).keys())
+        default_config = self.script_manager.default_config(script_id)
+        allowed = set(default_config.keys())
         cleaned = {
             key: value
             for key, value in dict(config).items()
             if key in allowed
         }
+        def set_default_if_allowed(key, value):
+            if key in allowed and key not in cleaned:
+                cleaned[key] = value
+
         if script_id == COORDINATE_FOLLOW_SCRIPT_ID:
             try:
                 distance = float(cleaned.get("distance_threshold", CoordinateFollowScript.DEFAULT_DISTANCE_THRESHOLD))
@@ -1289,13 +1295,27 @@ class SimKeysDesktopApp:
                 cleaned["distance_threshold"] = CoordinateFollowScript.DEFAULT_DISTANCE_THRESHOLD
             if "distance_threshold" not in cleaned:
                 cleaned["distance_threshold"] = CoordinateFollowScript.DEFAULT_DISTANCE_THRESHOLD
-            if "formation_radius" not in cleaned:
-                cleaned["formation_radius"] = CoordinateFollowScript.DEFAULT_FORMATION_RADIUS
-            if "max_follow_distance" not in cleaned:
-                cleaned["max_follow_distance"] = CoordinateFollowScript.DEFAULT_MAX_FOLLOW_DISTANCE
-            if "bypass_no_walk" not in cleaned:
-                cleaned["bypass_no_walk"] = True
+            set_default_if_allowed("formation_radius", CoordinateFollowScript.DEFAULT_FORMATION_RADIUS)
+            set_default_if_allowed("max_follow_distance", CoordinateFollowScript.DEFAULT_MAX_FOLLOW_DISTANCE)
+            set_default_if_allowed("bypass_no_walk", True)
+            set_default_if_allowed("follow_interval_seconds", CoordinateFollowScript.DEFAULT_FOLLOW_INTERVAL_SECONDS)
+            set_default_if_allowed("position_poll_interval", CoordinateFollowScript.DEFAULT_POSITION_POLL_INTERVAL)
+            set_default_if_allowed("poll_interval", CoordinateFollowScript.DEFAULT_POLL_INTERVAL)
         return cleaned
+
+    def _migrate_coordinate_follow_timing_defaults(self, config):
+        migrations = (
+            ("follow_interval_seconds", 0.5, CoordinateFollowScript.DEFAULT_FOLLOW_INTERVAL_SECONDS),
+            ("position_poll_interval", 0.25, CoordinateFollowScript.DEFAULT_POSITION_POLL_INTERVAL),
+            ("poll_interval", 0.05, CoordinateFollowScript.DEFAULT_POLL_INTERVAL),
+        )
+        for key, old_value, new_value in migrations:
+            try:
+                current = float(config.get(key, old_value))
+            except (TypeError, ValueError):
+                current = old_value
+            if key not in config or abs(current - old_value) < 0.0001:
+                config[key] = new_value
 
     def _load_character_defaults_store(self):
         self.character_script_configs = {}
@@ -1355,6 +1375,8 @@ class SimKeysDesktopApp:
                         cleaned_config["formation_radius"] = CoordinateFollowScript.DEFAULT_FORMATION_RADIUS
                     if not bool(cleaned_config.get("bypass_no_walk", False)):
                         cleaned_config["bypass_no_walk"] = True
+                if payload_version < 6 and script_id == COORDINATE_FOLLOW_SCRIPT_ID:
+                    self._migrate_coordinate_follow_timing_defaults(cleaned_config)
                 cleaned[script_id] = cleaned_config
 
             auto_start = entry.get("auto_start", [])
@@ -1386,7 +1408,7 @@ class SimKeysDesktopApp:
             self.character_display_names[normalized] = name
 
     def _save_character_defaults_store(self):
-        payload = {"version": 5, "characters": {}}
+        payload = {"version": CHARACTER_DEFAULTS_VERSION, "characters": {}}
         character_keys = (
             set(self.character_script_configs.keys())
             | set(self.character_script_autostart.keys())

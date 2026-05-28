@@ -87,6 +87,7 @@ _DAMAGE_TYPE_LABEL_BY_ID.update({
     10: "Negative",
     11: "Positive",
 })
+AREA_TRANSITION_LINE_RE = re.compile(r"\bYou are now in\s+(.+?)(?:\.\s*)?$")
 
 
 def _build_quickbar_slot_choices() -> List[str]:
@@ -487,6 +488,9 @@ def parse_chat_line_event(sequence: int, text: str, password_prompt_text: str = 
     if password_prompt_text and lowered == password_prompt_text.strip().lower():
         password_prompt = True
         kinds.add("password_prompt")
+
+    if AREA_TRANSITION_LINE_RE.search(normalized):
+        kinds.add("area_transition")
 
     if " attacks " in lowered:
         attack = hgx_combat.parse_attack_line(raw_text)
@@ -6418,10 +6422,13 @@ class CoordinateFollowScript(ClientScriptBase):
     script_label = "Coordinate Follow"
     ROLE_FOLLOWER = "Follower"
     ROLE_LEAD = "Lead"
+    DEFAULT_FOLLOW_INTERVAL_SECONDS = 1.5
+    DEFAULT_POSITION_POLL_INTERVAL = 1.0
+    DEFAULT_POLL_INTERVAL = 0.20
     DEFAULT_DISTANCE_THRESHOLD = 1.0
     DEFAULT_FORMATION_RADIUS = 0.0
     DEFAULT_MAX_FOLLOW_DISTANCE = 300.0
-    AREA_TRANSITION_RE = re.compile(r"\bYou are now in\s+(.+?)(?:\.\s*)?$")
+    AREA_TRANSITION_RE = AREA_TRANSITION_LINE_RE
     AREA_QUERY_KEYS = (
         "area_id",
         "area_object_id",
@@ -6486,12 +6493,13 @@ class CoordinateFollowScript(ClientScriptBase):
         return True
 
     def chat_event_types(self) -> Tuple[str, ...]:
-        return ("raw",)
+        return ("attack", "damage", "area_transition")
 
     def on_chat_event(self, event: ChatLineEvent):
         if not self.should_process(event.sequence) or not self.enabled:
             return
-        self._observe_area_event(event.raw_text)
+        if event.has_kind("area_transition"):
+            self._observe_area_event(event.raw_text)
         self._observe_combat_event(event)
 
     def on_tick(self):
@@ -6749,10 +6757,10 @@ class CoordinateFollowScript(ClientScriptBase):
         return str(self.config.get("role", self.ROLE_FOLLOWER) or "").strip().lower() == self.ROLE_LEAD.lower()
 
     def _follow_interval_seconds(self) -> float:
-        return max(float(self.config.get("follow_interval_seconds", 0.5)), 0.1)
+        return max(float(self.config.get("follow_interval_seconds", self.DEFAULT_FOLLOW_INTERVAL_SECONDS)), 0.1)
 
     def _position_poll_interval(self) -> float:
-        return max(float(self.config.get("position_poll_interval", 0.25)), 0.05)
+        return max(float(self.config.get("position_poll_interval", self.DEFAULT_POSITION_POLL_INTERVAL)), 0.05)
 
     def _distance_threshold(self) -> float:
         return max(float(self.config.get("distance_threshold", self.DEFAULT_DISTANCE_THRESHOLD)), 0.0)
@@ -8325,7 +8333,7 @@ class ClientScriptHost:
     PASSWORD_CHAT_BLOCK_SECONDS = 5.0
     PASSWORD_PROMPT_POLL_INTERVAL = 0.25
     PASSWORD_PROMPT_MAX_LINES = 20
-    DAMAGE_METER_POLL_INTERVAL = 0.10
+    DAMAGE_METER_POLL_INTERVAL = 0.20
     DAMAGE_METER_MAX_LINES = 200
 
     def __init__(self, client, event_callback: Callable[[dict], None]):
@@ -9026,9 +9034,9 @@ class ScriptManager:
                 ),
                 ScriptField(
                     "follow_interval_seconds",
-                    "Interval",
+                    "Follow Interval",
                     "float",
-                    0.5,
+                    CoordinateFollowScript.DEFAULT_FOLLOW_INTERVAL_SECONDS,
                     minimum=0.1,
                     maximum=5.0,
                     step=0.1,
@@ -9092,9 +9100,27 @@ class ScriptManager:
                     width=7,
                     help_text="How many seconds after any parsed attack or damage line before timer movement resumes.",
                 ),
-                ScriptField("position_poll_interval", "Lead Poll", "float", 0.25, minimum=0.05, maximum=2.0, step=0.05, width=6),
+                ScriptField(
+                    "position_poll_interval",
+                    "Lead Poll",
+                    "float",
+                    CoordinateFollowScript.DEFAULT_POSITION_POLL_INTERVAL,
+                    minimum=0.05,
+                    maximum=2.0,
+                    step=0.05,
+                    width=6,
+                ),
                 ScriptField("lead_stale_seconds", "Stale", "float", 3.0, minimum=0.25, maximum=30.0, step=0.25, width=6),
-                ScriptField("poll_interval", "Poll", "float", 0.05, minimum=0.01, maximum=2.0, step=0.01, width=6),
+                ScriptField(
+                    "poll_interval",
+                    "Poll",
+                    "float",
+                    CoordinateFollowScript.DEFAULT_POLL_INTERVAL,
+                    minimum=0.05,
+                    maximum=2.0,
+                    step=0.05,
+                    width=6,
+                ),
                 ScriptField("max_lines", "Batch", "int", 120, minimum=1, maximum=500, step=1, width=5),
                 ScriptField("echo_console", "Echo", "bool", False),
                 ScriptField("include_backlog", "Backlog", "bool", False),

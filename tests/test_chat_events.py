@@ -641,6 +641,23 @@ class ChatEventTests(unittest.TestCase):
         self.assertEqual(host.slots, [])
         self.assertIn("Paused", drink.status_text)
 
+    def test_coordinate_follow_only_wants_relevant_chat_events(self):
+        host = FakeHost()
+        follow = CoordinateFollowScript(
+            host.client,
+            {"role": CoordinateFollowScript.ROLE_FOLLOWER},
+            host,
+        )
+
+        area_event = parse_chat_line_event(1, "You are now in Southern Watch.")
+        attack_event = parse_chat_line_event(2, "Balor attacks Dummy : *hit*")
+        chatter_event = parse_chat_line_event(3, "Someone says hello.")
+
+        self.assertIn("area_transition", area_event.kinds)
+        self.assertTrue(follow.wants_chat_event(area_event))
+        self.assertTrue(follow.wants_chat_event(attack_event))
+        self.assertFalse(follow.wants_chat_event(chatter_event))
+
     def test_coordinate_follow_spam_moves_to_published_lead_position(self):
         lead_host = FakeHost()
         lead_host.client.pid = 100
