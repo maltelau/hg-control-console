@@ -84,12 +84,6 @@ The Windows hook cannot be reused directly. Linux support now has a separate
 - Overlay: OpenGL/X11 text rendering from the SDL swap hook. The hook resolves
   those symbols dynamically from the loaded client libraries.
 
-The Windows cross-build path uses Zig:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\src\native\SimKeysHookLinux\build.ps1
-```
-
 The produced hook is an ELF32 i386 shared object with only `libc.so.6` as a
 declared dynamic dependency.
 
@@ -97,22 +91,14 @@ Already-running Linux clients are not injected. Launch `nwmain` with
 `LD_PRELOAD=libSimKeysHookLinux.so` through the launcher so HGCC can discover
 and control it.
 
-The Linux launcher mirrors the original `nwn` wrapper enough for the legacy
-client to start under WSLg: it prepends `lib`, `miles_linux`, `miles`, and the
-client directory to `LD_LIBRARY_PATH` when present, and sets
-`SDL_MOUSE_RELATIVE=0` plus `SDL_VIDEO_X11_DGAMOUSE=0`. This matters because
-`nwmain` depends on the game-supplied Miles library `libmss.so.6` and, in the
-classic package layout, the bundled SDL library under `lib`.
-
-The stripped XP2 client archive used for address matching does not include a
-complete runnable tree. A Reddit-style layered install was validated in WSL:
-Gold Linux client, HOTU Linux client, local 1.69 XP2 archive, then
-`./fixinstall`. That produced `miles/libmss.so.6`, `lib/libSDL-1.2.so.0`, and a
-working `nwn` wrapper. With the HGCC launcher and preload hook, the client
-starts, creates `simkeys_<pid>.sock`, lists as injected, and responds to query,
-chat-poll, overlay, quickbar, chat-send, movement, walk-bypass, and action-mode
-opcodes. In-game-only commands return controlled not-ready/timeout responses at
-the main menu.
+The Linux launcher mirrors the original `nwn` wrapper enough for existing
+working clients: it prepends `lib`, `miles_linux`, `miles`, and the client
+directory to `LD_LIBRARY_PATH` when present, and sets `SDL_MOUSE_RELATIVE=0`
+plus `SDL_VIDEO_X11_DGAMOUSE=0`. With the HGCC launcher and preload hook, the
+client starts, creates `simkeys_<pid>.sock`, lists as injected, and responds to
+query, chat-poll, overlay, quickbar, chat-send, movement, walk-bypass, and
+action-mode opcodes. In-game-only commands return controlled not-ready/timeout
+responses at the main menu.
 
 Remaining validation work:
 

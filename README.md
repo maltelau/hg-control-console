@@ -38,29 +38,14 @@ The GUI launcher requests administrator access if needed.
 
 ## Linux Client Support
 
-Linux support targets the 32-bit NWN 1.69 Linux client. Build the preload hook, then start the game through the launcher:
+Linux support targets the 32-bit NWN 1.69 Linux client. On Linux, build the preload hook, then start the game through the launcher:
 
 ```bash
 ./src/native/SimKeysHookLinux/build.sh
 ./simkeys_linux_client.sh --client-dir /path/to/English_linuxclient_xp2
 ```
 
-From Windows, the same hook can be cross-compiled with Zig:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\src\native\SimKeysHookLinux\build.ps1
-```
-
-To prepare a WSL test distro, run:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\setup_linux_test_env.ps1 -InstallWsl -Bootstrap
-```
-
-This may prompt for administrator approval and a restart because it installs WSL/Ubuntu 24.04 when they are missing.
-For Google Drive or mapped-drive checkouts, stage the repo and Linux client on `C:` first, for example under `C:\CodexWSL\NWN`. The WSL helper refuses to mount non-system drives by default; pass `-Repo` and `-ClientDir` pointing at the staged `C:` copies.
-
-The old Diamond Linux client also needs the bundled compatibility libraries from a complete Linux/Diamond install. The classic install order is Gold Linux client, HOTU Linux client, then the 1.69 XP2 Linux client, followed by `./fixinstall`. In that layered tree, `libmss.so.6` lives under `miles`, and the old `nwn` wrapper also prepends `lib` for its bundled SDL. The HGCC launcher mirrors that behavior by adding `lib`, `miles_linux`, `miles`, and the client directory to `LD_LIBRARY_PATH` when present, and by setting the same SDL mouse compatibility flags. If `ldd nwmain` reports `libmss.so.6 => not found`, copy the missing `miles`/`miles_linux` folder from a complete Linux/Diamond install before launching.
+Use an existing working Linux NWN client. The HGCC launcher mirrors the original `nwn` wrapper by adding `lib`, `miles_linux`, `miles`, and the client directory to `LD_LIBRARY_PATH` when present, and by setting the same SDL mouse compatibility flags.
 
 Then run the Python GUI on the same Linux session and it will discover `nwmain` clients through `simkeys_<pid>.sock`.
 
@@ -71,7 +56,7 @@ The Linux hook provides the same HGCC operations as the Windows hook: quickbar s
 - Windows with Neverwinter Nights Diamond using the 32-bit `nwmain.exe` client, or Linux with the 32-bit NWN 1.69 `nwmain` client.
 - Python for the GUI and injector scripts. The launcher looks for `python`, the `py` launcher, and common Python 3.11-3.13 install locations.
 - Visual Studio 2022 Build Tools with the C++ workload only if rebuilding `SimKeysHook2.dll`.
-- On Linux, a 32-bit C++ toolchain is required only when rebuilding `libSimKeysHookLinux.so`. On Windows, Zig can cross-compile the Linux hook.
+- On Linux, a 32-bit C++ toolchain is required only when rebuilding `libSimKeysHookLinux.so`.
 
 The repository includes a prebuilt 32-bit hook DLL at `bin\SimKeysHook2.dll`, so Visual Studio is not required for normal use.
 
@@ -335,13 +320,7 @@ The build wrapper:
 3. Writes build output under `src\native\SimKeysHook2\Release\`.
 4. Copies the rebuilt DLL to `bin\SimKeysHook2.dll`.
 
-To rebuild the Linux preload hook from Windows, install Zig, then run:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\src\native\SimKeysHookLinux\build.ps1
-```
-
-On Linux, run:
+To rebuild the Linux preload hook, run this on Linux:
 
 ```bash
 ./src/native/SimKeysHookLinux/build.sh
