@@ -9,3 +9,4 @@ dependencies = []
 
 [project.gui-scripts]
 hgcc = "simkeys_app.simkeys_gui:main"
+hgnwn = "simkeys_app.launch_linux_client:main"
