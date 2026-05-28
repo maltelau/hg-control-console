@@ -51,6 +51,13 @@ Then run the Python GUI on the same Linux session and it will discover `nwmain` 
 
 The Linux hook provides the same HGCC operations as the Windows hook: quickbar slots, chat send/capture, overlays, player identity, position, movement, walk bypass, and action-mode toggles. Already-running Linux clients are not injected; launch them with `simkeys_linux_client.sh`.
 
+### Launching gui
+
+The python gui can be installed as `hgcc` in your PATH using uv:
+``` bash
+uv tool install -e .
+```
+
 ## Requirements
 
 - Windows with Neverwinter Nights Diamond using the 32-bit `nwmain.exe` client, or Linux with the 32-bit NWN 1.69 `nwmain` client.

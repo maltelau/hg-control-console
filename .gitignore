@@ -42,3 +42,9 @@ docs/reverse-engineering/
 Hgx.Client/
 Hgx.Core/
 NWN Diamond/
+
+# uv
+.python-version
+build/
+src/hg_control_console.egg-info/
+uv.lock
