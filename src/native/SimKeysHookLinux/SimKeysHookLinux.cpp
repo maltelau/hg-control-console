@@ -109,12 +109,14 @@ constexpr uint32_t kQuickbarSlotPrimaryItemOffset = 0x6Cu;
 constexpr uint32_t kQuickbarSlotSecondaryItemOffset = 0x70u;
 constexpr uint32_t kQuickbarSlotTypeOffset = 0xA0u;
 constexpr uint32_t kCurrentPlayerObjectIdOffset = 0x24u;
+constexpr uint32_t kAppInnerPlayerNameOffset = 0x160u;
 constexpr uint8_t kQuickbarItemSlotType = 1u;
 constexpr int kQuickbarPageCount = 3;
 constexpr int kQuickbarSlotCount = 12;
 constexpr int kQuickbarTotalSlots = 36;
 constexpr int kActionModeDefensiveCast = 10;
 constexpr uint32_t kInvalidObjectId = 0x7F000000u;
+constexpr uint32_t kInvalidObjectIdAlt = 0xFFFFFFFFu;
 constexpr uint32_t kCurrentPlayerPositionOffset = 0x30u;
 constexpr uint32_t kCreatureDefensiveCastingModeOffset = 0x4AEu;
 constexpr uint32_t kCreatureCurrentCombatModeOffset = 0x4AFu;
@@ -1063,6 +1065,13 @@ bool SafeReadString(const void* nwn_string, char* out, size_t capacity) {
   return true;
 }
 
+bool IsValidObjectId(uint32_t object_id) {
+  return object_id != 0 &&
+      object_id != kInvalidObjectId &&
+      object_id != kInvalidObjectIdAlt &&
+      object_id < 0x80000000u;
+}
+
 uint32_t ReadAppHolderPointer() {
   return SafeReadPointer32(kAppGlobalSlotAddress);
 }
@@ -1085,6 +1094,22 @@ uint32_t ReadCurrentPlayerObjectId() {
 uint32_t ReadCurrentGuiPointer() {
   const uint32_t app_inner = ReadAppInnerPointer();
   return app_inner != 0 ? SafeReadPointer32(static_cast<uintptr_t>(app_inner) + 0x48u) : 0;
+}
+
+bool ReadAppInnerPlayerName(char* out, size_t capacity) {
+  if (out == nullptr || capacity == 0) {
+    return false;
+  }
+  out[0] = '\0';
+  const uint32_t app_inner = ReadAppInnerPointer();
+  if (app_inner == 0) {
+    return false;
+  }
+  return SafeReadString(
+      reinterpret_cast<const void*>(static_cast<uintptr_t>(app_inner) + kAppInnerPlayerNameOffset),
+      out,
+      capacity) &&
+      out[0] != '\0';
 }
 
 bool IsQuickbarPanel(uint32_t panel) {
@@ -1205,7 +1230,7 @@ void UpdateQuickbarItemMasks() {
       continue;
     }
     const uint32_t primary_item_id = SafeReadPointer32(slot + kQuickbarSlotPrimaryItemOffset);
-    if (primary_item_id == 0 || primary_item_id == kInvalidObjectId) {
+    if (!IsValidObjectId(primary_item_id)) {
       continue;
     }
     if (index < 32) {
@@ -1698,6 +1723,10 @@ uint32_t ResolveCurrentClientPlayer() {
   if (app_object == 0) {
     return 0;
   }
+  const uint32_t object_id = ReadCurrentPlayerObjectId();
+  if (!IsValidObjectId(object_id)) {
+    return 0;
+  }
   typedef void* (*ResolverFn)(void*);
   uint32_t result = 0;
   int signal_number = 0;
@@ -1719,7 +1748,7 @@ uint32_t ResolveCurrentServerCreature(uint32_t* out_game_object) {
   }
   const uint32_t object_id = ReadCurrentPlayerObjectId();
   const uint32_t server_app = ReadAppObjectPointer();
-  if (object_id == 0 || object_id == kInvalidObjectId || server_app == 0) {
+  if (!IsValidObjectId(object_id) || server_app == 0) {
     return 0;
   }
   typedef void* (*ObjectByIdFn)(void*, uint32_t);
@@ -1840,6 +1869,10 @@ bool RefreshCharacterIdentity(int32_t* out_error) {
     BuildCurrentPlayerName(client_player, name, sizeof(name));
   }
 
+  if (name[0] == '\0') {
+    ReadAppInnerPlayerName(name, sizeof(name));
+  }
+
   if (name[0] == '\0' && game_object != 0) {
     const uint32_t vtable = SafeReadPointer32(game_object);
     const uint32_t first_name_fn = vtable != 0 ? SafeReadPointer32(vtable + 0x98u) : 0;
@@ -1905,7 +1938,7 @@ bool RefreshCharacterIdentity(int32_t* out_error) {
   pthread_mutex_unlock(&g_state.overlay_mutex);
   AtomicSet(&g_state.player_object, static_cast<int32_t>(client_player != 0 ? client_player : game_object));
   AtomicSet(&g_state.player_creature, static_cast<int32_t>(creature));
-  const int32_t err = (client_player != 0 || creature != 0) ? kErrSuccess : kErrNotFound;
+  const int32_t err = (name[0] != '\0' || client_player != 0 || creature != 0) ? kErrSuccess : kErrNotFound;
   AtomicSet(&g_state.identity_error, err);
   AtomicIncrement(&g_state.identity_refresh_count);
   UpdateQuickbarItemMasks();
@@ -2752,8 +2785,7 @@ bool RunRefreshIdentity() {
 }
 
 bool CanRefreshIdentityNow() {
-  const uint32_t object_id = ReadCurrentPlayerObjectId();
-  return ReadAppObjectPointer() != 0 && object_id != 0 && object_id != kInvalidObjectId;
+  return ReadAppObjectPointer() != 0 && ReadAppInnerPointer() != 0;
 }
 
 void FillQueryResponse(QueryResponse* response) {
