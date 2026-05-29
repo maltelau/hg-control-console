@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -24,6 +25,10 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef RTLD_NOLOAD
+#define RTLD_NOLOAD 0
+#endif
 
 extern "C" __attribute__((visibility("hidden"))) void SimKeysLinuxCaptureQuickbarExec(int32_t panel, int32_t slot_index);
 extern "C" __attribute__((visibility("hidden"))) void SimKeysLinuxCaptureQuickbarSlotDispatch(int32_t slot_ptr);
@@ -146,6 +151,23 @@ constexpr int kErrTimeout = 258;
 constexpr int kErrBusy = 170;
 constexpr int kErrNotFound = 1168;
 constexpr int kErrInvalidState = 5023;
+constexpr uint8_t kSdlActiveEvent = 1;
+constexpr uint8_t kSdlUserEvent = 24;
+constexpr uint32_t kSdlUserEventMask = 1u << kSdlUserEvent;
+constexpr size_t kSdlEventSize = 24;
+constexpr int kSdlGetEvent = 2;
+constexpr int32_t kSdlWakeEventCode = 0x534B574Bu;  // SKWK
+constexpr uint8_t kSdlActiveMask = 0x07u;
+constexpr uint8_t kSdlAppActiveMask = 0x07u;
+constexpr uint8_t kSdlKeyDownEvent = 2;
+constexpr uint8_t kSdlKeyUpEvent = 3;
+constexpr uint8_t kSdlPressed = 1;
+constexpr uint8_t kSdlReleased = 0;
+constexpr int32_t kSdlKeyF1 = 282;
+constexpr int32_t kSdlKeyLeftShift = 304;
+constexpr int32_t kSdlKeyLeftCtrl = 306;
+constexpr int32_t kSdlModShift = 0x0003;
+constexpr int32_t kSdlModCtrl = 0x00C0;
 
 #pragma pack(push, 1)
 struct PipeHeader {
@@ -405,6 +427,14 @@ struct HookState {
   int32_t quickbar_item_mask_high;
   int32_t quickbar_equipped_mask_low;
   int32_t quickbar_equipped_mask_high;
+  int32_t pending_drain_count;
+  int32_t pending_wake_attempts;
+  int32_t pending_wake_success;
+  int32_t pending_wake_swallowed;
+  int32_t pending_wake_missing_logged;
+  int32_t pending_signal_wake_attempts;
+  int32_t pending_signal_wake_success;
+  int32_t focus_loss_swallowed;
   int32_t position_valid;
   float position_x;
   float position_y;
@@ -461,11 +491,47 @@ struct GraphicsApi {
 GraphicsApi g_graphics = {};
 int g_graphics_ready = 0;
 int g_graphics_failed = 0;
+int32_t g_overlay_render_failed = 0;
 
 typedef void (*SdlGlSwapBuffersFn)();
 typedef int (*SdlPollEventFn)(void*);
+typedef int (*SdlWaitEventFn)(void*);
+typedef void (*SdlDelayFn)(uint32_t);
+typedef int (*SdlPushEventFn)(void*);
+typedef int (*SdlPeepEventsFn)(void*, int, int, uint32_t);
+typedef uint8_t (*SdlGetAppStateFn)();
 SdlGlSwapBuffersFn g_real_sdl_gl_swap_buffers = nullptr;
 SdlPollEventFn g_real_sdl_poll_event = nullptr;
+SdlWaitEventFn g_real_sdl_wait_event = nullptr;
+SdlDelayFn g_real_sdl_delay = nullptr;
+SdlPushEventFn g_real_sdl_push_event = nullptr;
+SdlPeepEventsFn g_real_sdl_peep_events = nullptr;
+SdlGetAppStateFn g_real_sdl_get_app_state = nullptr;
+void* g_sdl12_handle = nullptr;
+int32_t g_sdl_wake_event_queued = 0;
+pthread_t g_main_thread = {};
+int32_t g_main_thread_ready = 0;
+int32_t g_wake_signal_installed = 0;
+int32_t g_keep_sdl_active = -1;
+int32_t g_overlay_render_enabled = -1;
+
+struct FaultGuard {
+  sigjmp_buf jump;
+  FaultGuard* previous;
+  int signal_number;
+};
+
+__thread FaultGuard* g_active_fault_guard = nullptr;
+int32_t g_fault_handlers_installed = 0;
+struct sigaction g_previous_sigsegv = {};
+struct sigaction g_previous_sigbus = {};
+struct sigaction g_previous_sigill = {};
+
+void LogMessage(int level, const char* format, ...);
+void DrainPendingOnMainThread();
+
+void WakeSignalHandler(int) {
+}
 
 uint32_t AtomicGet(const int32_t* value) {
   return static_cast<uint32_t>(__sync_add_and_fetch(const_cast<int32_t*>(value), 0));
@@ -477,6 +543,278 @@ void AtomicSet(int32_t* value, int32_t next) {
 
 int32_t AtomicIncrement(int32_t* value) {
   return __sync_add_and_fetch(value, 1);
+}
+
+bool IsHookMainThread() {
+  return AtomicGet(&g_main_thread_ready) != 0 && pthread_equal(pthread_self(), g_main_thread);
+}
+
+bool KeepSdlActiveEnabled() {
+  int32_t cached = static_cast<int32_t>(AtomicGet(&g_keep_sdl_active));
+  if (cached >= 0) {
+    return cached != 0;
+  }
+
+  const char* value = getenv("SIMKEYS_LINUX_KEEP_ACTIVE");
+  const bool enabled = value == nullptr ||
+      value[0] == '\0' ||
+      (value[0] != '0' && value[0] != 'f' && value[0] != 'F' && value[0] != 'n' && value[0] != 'N');
+  AtomicSet(&g_keep_sdl_active, enabled ? 1 : 0);
+  return enabled;
+}
+
+bool OverlayRenderingEnabled() {
+  int32_t cached = static_cast<int32_t>(AtomicGet(&g_overlay_render_enabled));
+  if (cached >= 0) {
+    return cached != 0;
+  }
+
+  const char* value = getenv("SIMKEYS_LINUX_ENABLE_OVERLAY");
+  const bool enabled = value != nullptr &&
+      value[0] != '\0' &&
+      value[0] != '0' &&
+      value[0] != 'f' &&
+      value[0] != 'F' &&
+      value[0] != 'n' &&
+      value[0] != 'N';
+  AtomicSet(&g_overlay_render_enabled, enabled ? 1 : 0);
+  return enabled;
+}
+
+bool EnvFlagEnabled(const char* name) {
+  const char* value = getenv(name);
+  return value != nullptr &&
+      value[0] != '\0' &&
+      value[0] != '0' &&
+      value[0] != 'f' &&
+      value[0] != 'F' &&
+      value[0] != 'n' &&
+      value[0] != 'N';
+}
+
+const struct sigaction* PreviousFaultAction(int signal_number) {
+  switch (signal_number) {
+    case SIGBUS:
+      return &g_previous_sigbus;
+    case SIGILL:
+      return &g_previous_sigill;
+    case SIGSEGV:
+    default:
+      return &g_previous_sigsegv;
+  }
+}
+
+void FaultSignalHandler(int signal_number, siginfo_t*, void*) {
+  FaultGuard* guard = g_active_fault_guard;
+  if (guard != nullptr) {
+    guard->signal_number = signal_number;
+    siglongjmp(guard->jump, 1);
+  }
+
+  const struct sigaction* previous = PreviousFaultAction(signal_number);
+  sigaction(signal_number, previous, nullptr);
+  raise(signal_number);
+}
+
+void InstallFaultHandlers() {
+  if (__sync_lock_test_and_set(&g_fault_handlers_installed, 1) != 0) {
+    return;
+  }
+
+  struct sigaction action = {};
+  action.sa_sigaction = FaultSignalHandler;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = SA_SIGINFO | SA_NODEFER;
+  sigaction(SIGSEGV, &action, &g_previous_sigsegv);
+  sigaction(SIGBUS, &action, &g_previous_sigbus);
+  sigaction(SIGILL, &action, &g_previous_sigill);
+}
+
+void InstallWakeSignalHandler() {
+  struct sigaction previous = {};
+  if (sigaction(SIGUSR1, nullptr, &previous) != 0) {
+    return;
+  }
+  if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN) {
+    LogMessage(kLogDebug, "SIGUSR1 is already handled; pending wake signal nudge disabled");
+    return;
+  }
+
+  struct sigaction action = {};
+  action.sa_handler = WakeSignalHandler;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGUSR1, &action, nullptr) == 0) {
+    AtomicSet(&g_wake_signal_installed, 1);
+  }
+}
+
+template <typename Fn>
+bool RunWithFaultGuard(Fn fn, int* out_signal) {
+  FaultGuard guard = {};
+  guard.previous = g_active_fault_guard;
+  g_active_fault_guard = &guard;
+  const int jumped = sigsetjmp(guard.jump, 1);
+  if (jumped == 0) {
+    fn();
+  }
+  g_active_fault_guard = guard.previous;
+  if (jumped != 0) {
+    if (out_signal != nullptr) {
+      *out_signal = guard.signal_number;
+    }
+    errno = EFAULT;
+    return false;
+  }
+  if (out_signal != nullptr) {
+    *out_signal = 0;
+  }
+  return true;
+}
+
+void NudgeMainThreadForPending() {
+  if (AtomicGet(&g_wake_signal_installed) == 0 || AtomicGet(&g_main_thread_ready) == 0) {
+    return;
+  }
+  if (IsHookMainThread()) {
+    return;
+  }
+
+  AtomicIncrement(&g_state.pending_signal_wake_attempts);
+  if (pthread_kill(g_main_thread, SIGUSR1) == 0) {
+    AtomicIncrement(&g_state.pending_signal_wake_success);
+  }
+}
+
+void* ResolveSdl12Symbol(const char* name) {
+  if (g_sdl12_handle == nullptr) {
+    g_sdl12_handle = dlopen("libSDL-1.2.so.0", RTLD_LAZY | RTLD_NOLOAD);
+    if (g_sdl12_handle == nullptr) {
+      g_sdl12_handle = dlopen("libSDL-1.2.so", RTLD_LAZY | RTLD_NOLOAD);
+    }
+  }
+  if (g_sdl12_handle != nullptr) {
+    void* symbol = dlsym(g_sdl12_handle, name);
+    if (symbol != nullptr) {
+      return symbol;
+    }
+  }
+  return dlsym(RTLD_NEXT, name);
+}
+
+SdlPushEventFn ResolveSdlPushEvent() {
+  if (g_real_sdl_push_event == nullptr) {
+    g_real_sdl_push_event = reinterpret_cast<SdlPushEventFn>(ResolveSdl12Symbol("SDL_PushEvent"));
+  }
+  return g_real_sdl_push_event;
+}
+
+SdlPeepEventsFn ResolveSdlPeepEvents() {
+  if (g_real_sdl_peep_events == nullptr) {
+    g_real_sdl_peep_events = reinterpret_cast<SdlPeepEventsFn>(ResolveSdl12Symbol("SDL_PeepEvents"));
+  }
+  return g_real_sdl_peep_events;
+}
+
+bool IsSimKeysWakeEvent(const void* event) {
+  if (event == nullptr) {
+    return false;
+  }
+  const uint8_t* bytes = static_cast<const uint8_t*>(event);
+  if (bytes[0] != kSdlUserEvent) {
+    return false;
+  }
+  int32_t code = 0;
+  memcpy(&code, bytes + 4, sizeof(code));
+  return code == kSdlWakeEventCode;
+}
+
+bool IsSdlFocusLossEvent(const void* event) {
+  if (!KeepSdlActiveEnabled() || event == nullptr) {
+    return false;
+  }
+  const uint8_t* bytes = static_cast<const uint8_t*>(event);
+  if (bytes[0] != kSdlActiveEvent) {
+    return false;
+  }
+
+  const uint8_t gain = bytes[1];
+  const uint8_t state = bytes[2];
+  return gain == 0 && (state & kSdlActiveMask) != 0;
+}
+
+bool FilterSdlInternalEvent(void* event) {
+  if (IsSimKeysWakeEvent(event)) {
+    AtomicIncrement(&g_state.pending_wake_swallowed);
+    AtomicSet(&g_sdl_wake_event_queued, 0);
+    DrainPendingOnMainThread();
+    return true;
+  }
+
+  if (IsSdlFocusLossEvent(event)) {
+    AtomicIncrement(&g_state.focus_loss_swallowed);
+    return true;
+  }
+
+  return false;
+}
+
+int FilterSdlInternalEvents(void* events, int count) {
+  if (events == nullptr || count <= 0) {
+    return count;
+  }
+
+  uint8_t* bytes = static_cast<uint8_t*>(events);
+  int kept = 0;
+  for (int i = 0; i < count; ++i) {
+    uint8_t* event = bytes + static_cast<size_t>(i) * kSdlEventSize;
+    if (FilterSdlInternalEvent(event)) {
+      continue;
+    }
+
+    if (kept != i) {
+      memmove(
+          bytes + static_cast<size_t>(kept) * kSdlEventSize,
+          event,
+          kSdlEventSize);
+    }
+    ++kept;
+  }
+  return kept;
+}
+
+void WakeMainThreadForPending(PendingKind kind) {
+  AtomicIncrement(&g_state.pending_wake_attempts);
+  const bool coalesce = kind == kPendingRefreshIdentity;
+  if (coalesce && __sync_lock_test_and_set(&g_sdl_wake_event_queued, 1) != 0) {
+    return;
+  }
+  if (!coalesce) {
+    AtomicSet(&g_sdl_wake_event_queued, 1);
+  }
+
+  SdlPushEventFn push_event = ResolveSdlPushEvent();
+  if (push_event == nullptr) {
+    AtomicSet(&g_sdl_wake_event_queued, 0);
+    if (__sync_bool_compare_and_swap(&g_state.pending_wake_missing_logged, 0, 1)) {
+      LogMessage(kLogDebug, "SDL_PushEvent is unavailable; pending work will drain on the next client tick");
+    }
+    NudgeMainThreadForPending();
+    return;
+  }
+
+  uint8_t event[64] = {};
+  event[0] = kSdlUserEvent;
+  const int32_t code = kSdlWakeEventCode;
+  memcpy(event + 4, &code, sizeof(code));
+
+  const int rc = push_event(event);
+  if (rc == 0) {
+    AtomicIncrement(&g_state.pending_wake_success);
+  } else {
+    AtomicSet(&g_sdl_wake_event_queued, 0);
+    LogMessage(kLogDebug, "SDL_PushEvent wake failed rc=%d errno=%d", rc, errno);
+  }
+  NudgeMainThreadForPending();
 }
 
 bool IsPlausibleCoordinate(float value) {
@@ -647,6 +985,31 @@ bool RangeIsMapped(uintptr_t address, size_t size, bool need_write) {
   return ok;
 }
 
+bool RangeIsExecutable(uintptr_t address, size_t size) {
+  FILE* fp = fopen("/proc/self/maps", "r");
+  if (fp == nullptr) {
+    return address >= kImageBase && address + size < 0xF0000000u;
+  }
+
+  char line[512] = {};
+  const uintptr_t wanted_end = address + size;
+  bool ok = false;
+  while (fgets(line, sizeof(line), fp) != nullptr) {
+    unsigned long start = 0;
+    unsigned long end = 0;
+    char perms[8] = {};
+    if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) {
+      continue;
+    }
+    if (address >= start && wanted_end <= end && perms[2] == 'x') {
+      ok = true;
+      break;
+    }
+  }
+  fclose(fp);
+  return ok;
+}
+
 template <typename T>
 bool SafeReadValue(uintptr_t address, T* out) {
   if (out == nullptr || !RangeIsMapped(address, sizeof(T), false)) {
@@ -655,7 +1018,15 @@ bool SafeReadValue(uintptr_t address, T* out) {
     }
     return false;
   }
-  memcpy(out, reinterpret_cast<const void*>(address), sizeof(T));
+  int signal_number = 0;
+  if (!RunWithFaultGuard(
+          [&]() {
+            memcpy(out, reinterpret_cast<const void*>(address), sizeof(T));
+          },
+          &signal_number)) {
+    memset(out, 0, sizeof(T));
+    return false;
+  }
   return true;
 }
 
@@ -698,18 +1069,22 @@ uint32_t ReadAppHolderPointer() {
 
 uint32_t ReadAppObjectPointer() {
   const uint32_t holder = ReadAppHolderPointer();
-  return holder != 0 ? SafeReadPointer32(static_cast<uintptr_t>(holder) + 4u) : 0;
+  return holder != 0 ? SafeReadPointer32(holder) : 0;
+}
+
+uint32_t ReadAppInnerPointer() {
+  const uint32_t app_object = ReadAppObjectPointer();
+  return app_object != 0 ? SafeReadPointer32(static_cast<uintptr_t>(app_object) + 4u) : 0;
 }
 
 uint32_t ReadCurrentPlayerObjectId() {
-  const uint32_t app_object = ReadAppObjectPointer();
-  return app_object != 0 ? SafeReadPointer32(static_cast<uintptr_t>(app_object) + kCurrentPlayerObjectIdOffset) : 0;
+  const uint32_t app_inner = ReadAppInnerPointer();
+  return app_inner != 0 ? SafeReadPointer32(static_cast<uintptr_t>(app_inner) + kCurrentPlayerObjectIdOffset) : 0;
 }
 
 uint32_t ReadCurrentGuiPointer() {
-  const uint32_t holder = ReadAppHolderPointer();
-  const uint32_t app_object = ReadAppObjectPointer();
-  return (holder != 0 && app_object != 0) ? SafeReadPointer32(static_cast<uintptr_t>(app_object) + 0x48u) : 0;
+  const uint32_t app_inner = ReadAppInnerPointer();
+  return app_inner != 0 ? SafeReadPointer32(static_cast<uintptr_t>(app_inner) + 0x48u) : 0;
 }
 
 bool IsQuickbarPanel(uint32_t panel) {
@@ -1041,15 +1416,18 @@ bool InstallInlineHook(uint32_t address, size_t stolen, void* thunk, uint8_t* or
 }
 
 void InstallHooks() {
-  if (AtomicGet(&g_state.quickbar_trace_installed) == 0 &&
-      InstallInlineHook(kQuickbarExec, 6, reinterpret_cast<void*>(QuickbarExecTraceThunk), g_quickbar_exec_original, &g_quickbar_exec_gateway)) {
-    AtomicSet(&g_state.quickbar_trace_installed, 1);
+  if (EnvFlagEnabled("SIMKEYS_LINUX_ENABLE_QUICKBAR_TRACE")) {
+    if (AtomicGet(&g_state.quickbar_trace_installed) == 0 &&
+        InstallInlineHook(kQuickbarExec, 6, reinterpret_cast<void*>(QuickbarExecTraceThunk), g_quickbar_exec_original, &g_quickbar_exec_gateway)) {
+      AtomicSet(&g_state.quickbar_trace_installed, 1);
+    }
+    if (AtomicGet(&g_state.quickbar_slot_trace_installed) == 0 &&
+        InstallInlineHook(kQuickbarSlotDispatch, 6, reinterpret_cast<void*>(QuickbarSlotTraceThunk), g_quickbar_slot_original, &g_quickbar_slot_gateway)) {
+      AtomicSet(&g_state.quickbar_slot_trace_installed, 1);
+    }
   }
-  if (AtomicGet(&g_state.quickbar_slot_trace_installed) == 0 &&
-      InstallInlineHook(kQuickbarSlotDispatch, 6, reinterpret_cast<void*>(QuickbarSlotTraceThunk), g_quickbar_slot_original, &g_quickbar_slot_gateway)) {
-    AtomicSet(&g_state.quickbar_slot_trace_installed, 1);
-  }
-  if (AtomicGet(&g_state.chat_trace_installed) == 0 &&
+  if (EnvFlagEnabled("SIMKEYS_LINUX_ENABLE_CHAT_TRACE") &&
+      AtomicGet(&g_state.chat_trace_installed) == 0 &&
       InstallInlineHook(kChatWindowLog, 9, reinterpret_cast<void*>(ChatWindowLogTraceThunk), g_chat_log_original, &g_chat_log_gateway)) {
     AtomicSet(&g_state.chat_trace_installed, 1);
   }
@@ -1078,7 +1456,21 @@ bool CallQuickbarPageSelectDirect(int32_t page_index, int32_t* out_resolved_page
 
   typedef void (*QuickbarPageSelectFn)(void*, int32_t);
   const QuickbarPageSelectFn fn = reinterpret_cast<QuickbarPageSelectFn>(kQuickbarPageSelect);
-  fn(reinterpret_cast<void*>(panel), page_index);
+  int signal_number = 0;
+  if (!RunWithFaultGuard(
+          [&]() {
+            fn(reinterpret_cast<void*>(panel), page_index);
+          },
+          &signal_number)) {
+    LogMessage(
+        kLogDebug,
+        "quickbar page select faulted signal=%d panel=0x%08X page=%d",
+        signal_number,
+        panel,
+        page_index);
+    errno = EFAULT;
+    return false;
+  }
 
   const int32_t resolved_page = ResolveQuickbarPageIndex(panel);
   if (out_resolved_page != nullptr) {
@@ -1132,7 +1524,22 @@ int32_t CallQuickbarExecDirect(int32_t slot_index) {
 
   typedef int32_t (*QuickbarExecFn)(void*, int32_t);
   const QuickbarExecFn fn = reinterpret_cast<QuickbarExecFn>(kQuickbarExec);
-  const int32_t native_rc = fn(reinterpret_cast<void*>(panel), slot_index);
+  int32_t native_rc = 0;
+  int signal_number = 0;
+  if (!RunWithFaultGuard(
+          [&]() {
+            native_rc = fn(reinterpret_cast<void*>(panel), slot_index);
+          },
+          &signal_number)) {
+    LogMessage(
+        kLogDebug,
+        "quickbar exec faulted signal=%d panel=0x%08X slot=%d",
+        signal_number,
+        panel,
+        slot_index);
+    errno = EFAULT;
+    return 0;
+  }
   (void)native_rc;
 
   const int32_t resolved_page = ResolveQuickbarPageIndex(panel);
@@ -1287,13 +1694,23 @@ int32_t CallMoveToLocationDirect(float x, float y, float z, int32_t client_side,
 }
 
 uint32_t ResolveCurrentClientPlayer() {
-  const uint32_t holder = ReadAppHolderPointer();
-  if (holder == 0) {
+  const uint32_t app_object = ReadAppObjectPointer();
+  if (app_object == 0) {
     return 0;
   }
   typedef void* (*ResolverFn)(void*);
-  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
-      reinterpret_cast<ResolverFn>(kCurrentClientPlayerResolver)(reinterpret_cast<void*>(holder))));
+  uint32_t result = 0;
+  int signal_number = 0;
+  if (!RunWithFaultGuard(
+          [&]() {
+            result = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+                reinterpret_cast<ResolverFn>(kCurrentClientPlayerResolver)(reinterpret_cast<void*>(app_object))));
+          },
+          &signal_number)) {
+    LogMessage(kLogDebug, "current player resolver faulted signal=%d appObject=0x%08X", signal_number, app_object);
+    return 0;
+  }
+  return result;
 }
 
 uint32_t ResolveCurrentServerCreature(uint32_t* out_game_object) {
@@ -1306,9 +1723,23 @@ uint32_t ResolveCurrentServerCreature(uint32_t* out_game_object) {
     return 0;
   }
   typedef void* (*ObjectByIdFn)(void*, uint32_t);
-  void* game_object = reinterpret_cast<ObjectByIdFn>(kServerObjectByIdResolver)(
-      reinterpret_cast<void*>(server_app),
-      object_id);
+  void* game_object = nullptr;
+  int signal_number = 0;
+  if (!RunWithFaultGuard(
+          [&]() {
+            game_object = reinterpret_cast<ObjectByIdFn>(kServerObjectByIdResolver)(
+                reinterpret_cast<void*>(server_app),
+                object_id);
+          },
+          &signal_number)) {
+    LogMessage(
+        kLogDebug,
+        "server object resolver faulted signal=%d appObject=0x%08X objectId=0x%08X",
+        signal_number,
+        server_app,
+        object_id);
+    return 0;
+  }
   if (game_object == nullptr) {
     return 0;
   }
@@ -1317,12 +1748,26 @@ uint32_t ResolveCurrentServerCreature(uint32_t* out_game_object) {
   }
   const uint32_t vtable = SafeReadPointer32(reinterpret_cast<uintptr_t>(game_object));
   const uint32_t as_creature_ptr = vtable != 0 ? SafeReadPointer32(vtable + kObjectAsCreatureVtableOffset) : 0;
-  if (as_creature_ptr == 0) {
+  if (as_creature_ptr == 0 || !RangeIsExecutable(as_creature_ptr, 1)) {
     return 0;
   }
   typedef void* (*AsCreatureFn)(void*);
-  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
-      reinterpret_cast<AsCreatureFn>(as_creature_ptr)(game_object)));
+  uint32_t creature = 0;
+  if (!RunWithFaultGuard(
+          [&]() {
+            creature = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+                reinterpret_cast<AsCreatureFn>(as_creature_ptr)(game_object)));
+          },
+          &signal_number)) {
+    LogMessage(
+        kLogDebug,
+        "as-creature resolver faulted signal=%d gameObject=0x%08X fn=0x%08X",
+        signal_number,
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(game_object)),
+        as_creature_ptr);
+    return 0;
+  }
+  return creature;
 }
 
 bool BuildCurrentPlayerName(uint32_t client_player, char* out, size_t capacity) {
@@ -1345,14 +1790,22 @@ bool BuildCurrentPlayerName(uint32_t client_player, char* out, size_t capacity) 
 #if defined(__i386__)
   void* ignored = nullptr;
   void* const fn = reinterpret_cast<void*>(kPlayerNameBuilder);
-  asm volatile(
-      "pushl %[player]\n"
-      "pushl %[name]\n"
-      "call *%[fn]\n"
-      "addl $4, %%esp\n"
-      : "=a"(ignored)
-      : [fn] "r"(fn), [name] "r"(&name), [player] "r"(reinterpret_cast<void*>(client_player))
-      : "ecx", "edx", "memory", "cc");
+  int signal_number = 0;
+  if (!RunWithFaultGuard(
+          [&]() {
+            asm volatile(
+                "pushl %[player]\n"
+                "pushl %[name]\n"
+                "call *%[fn]\n"
+                "addl $4, %%esp\n"
+                : "=a"(ignored)
+                : [fn] "r"(fn), [name] "r"(&name), [player] "r"(reinterpret_cast<void*>(client_player))
+                : "ecx", "edx", "memory", "cc");
+          },
+          &signal_number)) {
+    LogMessage(kLogDebug, "player name builder faulted signal=%d player=0x%08X", signal_number, client_player);
+    return false;
+  }
   (void)ignored;
 #else
   return false;
@@ -1361,7 +1814,14 @@ bool BuildCurrentPlayerName(uint32_t client_player, char* out, size_t capacity) 
   const bool ok = SafeReadString(&name, out, capacity) && out[0] != '\0';
   if (name.text != nullptr) {
     typedef void (*DestroyNwnStringFn)(NwnStringRef*, int32_t);
-    reinterpret_cast<DestroyNwnStringFn>(kNwnStringDestroy)(&name, 2);
+    int destroy_signal = 0;
+    if (!RunWithFaultGuard(
+            [&]() {
+              reinterpret_cast<DestroyNwnStringFn>(kNwnStringDestroy)(&name, 2);
+            },
+            &destroy_signal)) {
+      LogMessage(kLogDebug, "NWN string destroy faulted signal=%d namePtr=0x%08X", destroy_signal, reinterpret_cast<uint32_t>(name.text));
+    }
   }
   return ok;
 }
@@ -1369,7 +1829,7 @@ bool BuildCurrentPlayerName(uint32_t client_player, char* out, size_t capacity) 
 bool RefreshCharacterIdentity(int32_t* out_error) {
   uint32_t game_object = 0;
   const uint32_t client_player = ResolveCurrentClientPlayer();
-  const uint32_t creature = ResolveCurrentServerCreature(&game_object);
+  uint32_t creature = ResolveCurrentServerCreature(&game_object);
   char name[kCharacterNameCapacity] = {};
   int32_t position_valid = 0;
   float position_x = 0.0f;
@@ -1386,15 +1846,33 @@ bool RefreshCharacterIdentity(int32_t* out_error) {
     const uint32_t last_name_fn = vtable != 0 ? SafeReadPointer32(vtable + 0x9Cu) : 0;
     char first[64] = {};
     char last[64] = {};
-    if (first_name_fn != 0) {
+    if (first_name_fn != 0 && RangeIsExecutable(first_name_fn, 1)) {
       typedef void* (*NameFn)(void*);
-      void* first_obj = reinterpret_cast<NameFn>(first_name_fn)(reinterpret_cast<void*>(game_object));
-      SafeReadString(first_obj, first, sizeof(first));
+      void* first_obj = nullptr;
+      int signal_number = 0;
+      if (RunWithFaultGuard(
+              [&]() {
+                first_obj = reinterpret_cast<NameFn>(first_name_fn)(reinterpret_cast<void*>(game_object));
+              },
+              &signal_number)) {
+        SafeReadString(first_obj, first, sizeof(first));
+      } else {
+        LogMessage(kLogDebug, "first-name resolver faulted signal=%d gameObject=0x%08X fn=0x%08X", signal_number, game_object, first_name_fn);
+      }
     }
-    if (last_name_fn != 0) {
+    if (last_name_fn != 0 && RangeIsExecutable(last_name_fn, 1)) {
       typedef void* (*NameFn)(void*);
-      void* last_obj = reinterpret_cast<NameFn>(last_name_fn)(reinterpret_cast<void*>(game_object));
-      SafeReadString(last_obj, last, sizeof(last));
+      void* last_obj = nullptr;
+      int signal_number = 0;
+      if (RunWithFaultGuard(
+              [&]() {
+                last_obj = reinterpret_cast<NameFn>(last_name_fn)(reinterpret_cast<void*>(game_object));
+              },
+              &signal_number)) {
+        SafeReadString(last_obj, last, sizeof(last));
+      } else {
+        LogMessage(kLogDebug, "last-name resolver faulted signal=%d gameObject=0x%08X fn=0x%08X", signal_number, game_object, last_name_fn);
+      }
     }
     if (first[0] != '\0' && last[0] != '\0') {
       snprintf(name, sizeof(name), "%s %s", first, last);
@@ -1657,6 +2135,12 @@ bool ResolveGraphicsApi() {
 void TryInitXThreads() {
   typedef int (*XInitThreadsFn)();
   XInitThreadsFn init_threads = reinterpret_cast<XInitThreadsFn>(dlsym(RTLD_DEFAULT, "XInitThreads"));
+  if (init_threads == nullptr) {
+    void* x11 = dlopen("libX11.so.6", RTLD_LAZY | RTLD_GLOBAL);
+    if (x11 != nullptr) {
+      init_threads = reinterpret_cast<XInitThreadsFn>(dlsym(x11, "XInitThreads"));
+    }
+  }
   if (init_threads != nullptr) {
     init_threads();
   }
@@ -1707,7 +2191,56 @@ void DrawFilledRect(float x, float y, float w, float h, uint32_t rgb, float alph
   g_graphics.glEnd();
 }
 
-void RenderOverlayText(const OverlayRecord& record, int viewport_w, int viewport_h) {
+void DisableOverlayRenderingAfterFault(int signal_number, const char* phase) {
+  AtomicSet(&g_state.overlay_last_error, EFAULT);
+  if (__sync_lock_test_and_set(&g_overlay_render_failed, 1) == 0) {
+    LogMessage(kLogError, "overlay rendering disabled after %s fault signal=%d", phase, signal_number);
+  }
+  ClearAllOverlays();
+}
+
+int CopyActiveOverlays(OverlayRecord* records, int* indices, int capacity) {
+  int count = 0;
+  pthread_mutex_lock(&g_state.overlay_mutex);
+  for (int i = 0; i < kMaxOverlays && count < capacity; ++i) {
+    if (g_state.overlays[i].active) {
+      records[count] = g_state.overlays[i];
+      indices[count] = i;
+      ++count;
+    }
+  }
+  pthread_mutex_unlock(&g_state.overlay_mutex);
+  return count;
+}
+
+void UpdateRenderedOverlayBounds(const OverlayRecord& rendered, int index) {
+  if (index < 0 || index >= kMaxOverlays) {
+    return;
+  }
+  pthread_mutex_lock(&g_state.overlay_mutex);
+  OverlayRecord& current = g_state.overlays[index];
+  if (current.active && current.id == rendered.id) {
+    current.screen_x = rendered.screen_x;
+    current.screen_y = rendered.screen_y;
+    for (int i = 0; i < kOverlayMaxControls; ++i) {
+      current.controls[i].x1 = rendered.controls[i].x1;
+      current.controls[i].y1 = rendered.controls[i].y1;
+      current.controls[i].x2 = rendered.controls[i].x2;
+      current.controls[i].y2 = rendered.controls[i].y2;
+    }
+  }
+  pthread_mutex_unlock(&g_state.overlay_mutex);
+}
+
+void RestoreOverlayGlState() {
+  g_graphics.glPopMatrix();
+  g_graphics.glMatrixMode(GL_PROJECTION);
+  g_graphics.glPopMatrix();
+  g_graphics.glMatrixMode(GL_MODELVIEW);
+  g_graphics.glPopAttrib();
+}
+
+void RenderOverlayText(OverlayRecord& record, int viewport_w, int viewport_h) {
   if (!EnsureGlFont()) {
     return;
   }
@@ -1728,16 +2261,15 @@ void RenderOverlayText(const OverlayRecord& record, int viewport_w, int viewport
     }
   }
 
-  OverlayRecord* mutable_record = const_cast<OverlayRecord*>(&record);
-  mutable_record->screen_x = x;
-  mutable_record->screen_y = y;
+  record.screen_x = x;
+  record.screen_y = y;
   DrawFilledRect(x, y, record.width, record.height, 0x000000, 0.62f);
 
   if (record.control_count > 0) {
     int bx = x + kOverlayControlPadding;
     const int by = y + kOverlayControlPadding;
     for (int i = 0; i < record.control_count; ++i) {
-      OverlayControlButton& button = mutable_record->controls[i];
+      OverlayControlButton& button = record.controls[i];
       button.x1 = bx;
       button.y1 = by;
       button.x2 = bx + kOverlayControlButtonSize;
@@ -1790,46 +2322,94 @@ void RenderOverlayText(const OverlayRecord& record, int viewport_w, int viewport
 }
 
 void RenderOverlays() {
+  if (!OverlayRenderingEnabled()) {
+    return;
+  }
+  if (AtomicGet(&g_overlay_render_failed) != 0) {
+    return;
+  }
   if (AtomicGet(&g_state.overlay_count) == 0) {
     return;
   }
-  if (!ResolveGraphicsApi()) {
+
+  OverlayRecord records[kMaxOverlays] = {};
+  int indices[kMaxOverlays] = {};
+  const int record_count = CopyActiveOverlays(records, indices, kMaxOverlays);
+  if (record_count == 0) {
     return;
   }
+
+  int signal_number = 0;
+  bool graphics_ready = false;
+  if (!RunWithFaultGuard([&]() { graphics_ready = ResolveGraphicsApi(); }, &signal_number)) {
+    DisableOverlayRenderingAfterFault(signal_number, "graphics resolve");
+    return;
+  }
+  if (!graphics_ready) {
+    return;
+  }
+
   GLint viewport[4] = {};
-  g_graphics.glGetIntegerv(GL_VIEWPORT, viewport);
+  if (!RunWithFaultGuard([&]() { g_graphics.glGetIntegerv(GL_VIEWPORT, viewport); }, &signal_number)) {
+    DisableOverlayRenderingAfterFault(signal_number, "viewport query");
+    return;
+  }
   const int viewport_w = viewport[2];
   const int viewport_h = viewport[3];
   if (viewport_w <= 0 || viewport_h <= 0) {
     return;
   }
 
-  g_graphics.glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_TRANSFORM_BIT | GL_CURRENT_BIT);
-  g_graphics.glDisable(GL_DEPTH_TEST);
-  g_graphics.glDisable(GL_TEXTURE_2D);
-  g_graphics.glEnable(GL_BLEND);
-  g_graphics.glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-  g_graphics.glMatrixMode(GL_PROJECTION);
-  g_graphics.glPushMatrix();
-  g_graphics.glLoadIdentity();
-  g_graphics.glOrtho(0.0, viewport_w, viewport_h, 0.0, -1.0, 1.0);
-  g_graphics.glMatrixMode(GL_MODELVIEW);
-  g_graphics.glPushMatrix();
-  g_graphics.glLoadIdentity();
+  bool setup_complete = false;
+  if (!RunWithFaultGuard(
+          [&]() {
+            g_graphics.glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_TRANSFORM_BIT | GL_CURRENT_BIT);
+            g_graphics.glDisable(GL_DEPTH_TEST);
+            g_graphics.glDisable(GL_TEXTURE_2D);
+            g_graphics.glEnable(GL_BLEND);
+            g_graphics.glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            g_graphics.glMatrixMode(GL_PROJECTION);
+            g_graphics.glPushMatrix();
+            g_graphics.glLoadIdentity();
+            g_graphics.glOrtho(0.0, viewport_w, viewport_h, 0.0, -1.0, 1.0);
+            g_graphics.glMatrixMode(GL_MODELVIEW);
+            g_graphics.glPushMatrix();
+            g_graphics.glLoadIdentity();
+            setup_complete = true;
+          },
+          &signal_number)) {
+    DisableOverlayRenderingAfterFault(signal_number, "OpenGL setup");
+    return;
+  }
 
-  pthread_mutex_lock(&g_state.overlay_mutex);
-  for (int i = 0; i < kMaxOverlays; ++i) {
-    if (g_state.overlays[i].active) {
-      RenderOverlayText(g_state.overlays[i], viewport_w, viewport_h);
+  bool render_ok = true;
+  for (int i = 0; i < record_count; ++i) {
+    if (!RunWithFaultGuard([&]() { RenderOverlayText(records[i], viewport_w, viewport_h); }, &signal_number)) {
+      render_ok = false;
+      break;
     }
   }
-  pthread_mutex_unlock(&g_state.overlay_mutex);
 
-  g_graphics.glPopMatrix();
-  g_graphics.glMatrixMode(GL_PROJECTION);
-  g_graphics.glPopMatrix();
-  g_graphics.glMatrixMode(GL_MODELVIEW);
-  g_graphics.glPopAttrib();
+  bool cleanup_ok = true;
+  if (setup_complete &&
+      !RunWithFaultGuard([&]() { RestoreOverlayGlState(); }, &signal_number)) {
+    cleanup_ok = false;
+  }
+
+  if (!render_ok) {
+    DisableOverlayRenderingAfterFault(signal_number, "overlay draw");
+    return;
+  }
+  if (!cleanup_ok) {
+    DisableOverlayRenderingAfterFault(signal_number, "OpenGL cleanup");
+    return;
+  }
+
+  for (int i = 0; i < record_count; ++i) {
+    UpdateRenderedOverlayBounds(records[i], indices[i]);
+  }
+
+  AtomicSet(&g_state.overlay_last_error, 0);
   AtomicIncrement(&g_state.overlay_draws);
 }
 
@@ -1871,6 +2451,14 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
   y = g_state.position_y;
   z = g_state.position_z;
   pthread_mutex_unlock(&g_state.overlay_mutex);
+  int32_t pending_busy = 0;
+  int32_t pending_done = 0;
+  int32_t pending_kind = 0;
+  pthread_mutex_lock(&g_pending_mutex);
+  pending_busy = g_pending.busy;
+  pending_done = g_pending.done;
+  pending_kind = static_cast<int32_t>(g_pending.kind);
+  pthread_mutex_unlock(&g_pending_mutex);
 
   snprintf(
       out,
@@ -1881,7 +2469,8 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
       "hook: log=%s\n"
       "hook: installed=%d logLevel=%d pipeState=%d pipeErr=%d\n"
       "expected: quickbarExec=0x%08X quickbarPageSelect=0x%08X slotDispatch=0x%08X quickbarVtable=0x%08X chatSend=0x%08X chatWindowLog=0x%08X\n"
-      "engine: appGlobalSlot=0x%08X appHolder=0x%08X appObject=0x%08X currentObjectId=0x%08X\n"
+      "engine: appGlobalSlot=0x%08X appHolder=0x%08X appObject=0x%08X appInner=0x%08X currentObjectId=0x%08X\n"
+      "pending: busy=%d kind=%d done=%d drains=%d wakeAttempts=%d wakeSuccess=%d wakeSwallowed=%d signalAttempts=%d signalSuccess=%d focusLossSwallowed=%d\n"
       "quickbar: execTrace=%d slotTrace=%d capturedThis=0x%08X page=%d capturedSlot=%d slotPtr=0x%08X slotType=%d calls=%d scanAttempts=%d scanHits=%d itemMask=0x%08X%08X equippedMask=0x%08X%08X\n"
       "chat: trace=%d queued=%d nextWrite=%d latestSeq=%d lastMode=%d lastRc=%d lastErr=%d\n"
       "overlay: hook=%d count=%d draws=%d err=%d\n"
@@ -1906,7 +2495,18 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
       kAppGlobalSlotAddress,
       ReadAppHolderPointer(),
       ReadAppObjectPointer(),
+      ReadAppInnerPointer(),
       ReadCurrentPlayerObjectId(),
+      pending_busy,
+      pending_kind,
+      pending_done,
+      g_state.pending_drain_count,
+      g_state.pending_wake_attempts,
+      g_state.pending_wake_success,
+      g_state.pending_wake_swallowed,
+      g_state.pending_signal_wake_attempts,
+      g_state.pending_signal_wake_success,
+      g_state.focus_loss_swallowed,
       g_state.quickbar_trace_installed,
       g_state.quickbar_slot_trace_installed,
       g_state.quickbar_this,
@@ -1952,6 +2552,83 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
       g_state.last_error);
 }
 
+void BuildSdlKeyEvent(uint8_t* event, uint8_t type, uint8_t state, int32_t sym, int32_t mod) {
+  memset(event, 0, kSdlEventSize);
+  event[0] = type;
+  event[2] = state;
+  memcpy(event + 8, &sym, sizeof(sym));
+  memcpy(event + 12, &mod, sizeof(mod));
+}
+
+bool PushSdlKeyEvent(uint8_t type, uint8_t state, int32_t sym, int32_t mod) {
+  SdlPushEventFn push_event = ResolveSdlPushEvent();
+  if (push_event == nullptr) {
+    errno = ENOSYS;
+    return false;
+  }
+
+  uint8_t event[kSdlEventSize] = {};
+  BuildSdlKeyEvent(event, type, state, sym, mod);
+  if (push_event(event) != 0) {
+    errno = EIO;
+    return false;
+  }
+  return true;
+}
+
+bool PushQuickbarKeyEvents(int32_t page, int32_t slot) {
+  if (slot < 1 || slot > kQuickbarSlotCount || page < 0 || page >= kQuickbarPageCount) {
+    errno = EINVAL;
+    return false;
+  }
+
+  const int32_t key_sym = kSdlKeyF1 + slot - 1;
+  const int32_t modifier_sym = page == 1 ? kSdlKeyLeftShift : (page == 2 ? kSdlKeyLeftCtrl : 0);
+  const int32_t modifier_mask = page == 1 ? kSdlModShift : (page == 2 ? kSdlModCtrl : 0);
+
+  if (modifier_sym != 0 && !PushSdlKeyEvent(kSdlKeyDownEvent, kSdlPressed, modifier_sym, modifier_mask)) {
+    return false;
+  }
+  if (!PushSdlKeyEvent(kSdlKeyDownEvent, kSdlPressed, key_sym, modifier_mask)) {
+    return false;
+  }
+  if (!PushSdlKeyEvent(kSdlKeyUpEvent, kSdlReleased, key_sym, modifier_mask)) {
+    return false;
+  }
+  if (modifier_sym != 0 && !PushSdlKeyEvent(kSdlKeyUpEvent, kSdlReleased, modifier_sym, 0)) {
+    return false;
+  }
+  return true;
+}
+
+void CompleteTriggerSlotPending(PendingCommand* pending) {
+  if (pending == nullptr) {
+    return;
+  }
+  const int32_t vk = 0x70 + pending->slot - 1;
+  int32_t aux_rc = -1;
+  int32_t path = 0;
+  pending->trigger_response.vk = vk;
+  int32_t rc = CallQuickbarPageSlotDirect(pending->page, pending->slot, &aux_rc, &path);
+  int32_t last_error = rc ? 0 : errno;
+  if (!rc && PushQuickbarKeyEvents(pending->page, pending->slot)) {
+    rc = 1;
+    last_error = 0;
+    path = 4;
+  }
+  pending->trigger_response.rc = rc;
+  pending->trigger_response.success = pending->trigger_response.rc ? 1 : 0;
+  pending->trigger_response.aux_rc = aux_rc;
+  pending->trigger_response.last_error = pending->trigger_response.success ? 0 : last_error;
+  pending->trigger_response.path = path;
+  if (pending->trigger_response.success) {
+    UpdateQuickbarItemMasks();
+  }
+  AtomicSet(&g_state.last_vk, vk);
+  AtomicSet(&g_state.last_result, pending->trigger_response.rc);
+  AtomicSet(&g_state.last_error, pending->trigger_response.last_error);
+}
+
 bool SubmitPending(PendingKind kind, PendingCommand* template_command) {
   timespec deadline = {};
   clock_gettime(CLOCK_REALTIME, &deadline);
@@ -1971,6 +2648,11 @@ bool SubmitPending(PendingKind kind, PendingCommand* template_command) {
   g_pending.kind = kind;
   g_pending.busy = 1;
   g_pending.done = 0;
+  pthread_mutex_unlock(&g_pending_mutex);
+
+  WakeMainThreadForPending(kind);
+
+  pthread_mutex_lock(&g_pending_mutex);
   while (!g_pending.done) {
     const int rc = pthread_cond_timedwait(&g_pending_cond, &g_pending_mutex, &deadline);
     if (rc == ETIMEDOUT) {
@@ -1988,6 +2670,9 @@ bool SubmitPending(PendingKind kind, PendingCommand* template_command) {
 }
 
 void DrainPendingOnMainThread() {
+  if (AtomicGet(&g_state.installed) == 0 || !IsHookMainThread()) {
+    return;
+  }
   pthread_mutex_lock(&g_pending_mutex);
   if (!g_pending.busy || g_pending.done || g_pending.kind == kPendingNone) {
     pthread_mutex_unlock(&g_pending_mutex);
@@ -1995,21 +2680,11 @@ void DrainPendingOnMainThread() {
   }
   PendingKind kind = g_pending.kind;
   PendingCommand* pending = &g_pending;
+  AtomicIncrement(&g_state.pending_drain_count);
 
   switch (kind) {
     case kPendingTriggerSlot: {
-      const int32_t vk = 0x70 + pending->slot - 1;
-      int32_t aux_rc = -1;
-      int32_t path = 0;
-      pending->trigger_response.vk = vk;
-      pending->trigger_response.rc = CallQuickbarPageSlotDirect(pending->page, pending->slot, &aux_rc, &path);
-      pending->trigger_response.success = pending->trigger_response.rc ? 1 : 0;
-      pending->trigger_response.aux_rc = aux_rc;
-      pending->trigger_response.last_error = pending->trigger_response.success ? 0 : errno;
-      pending->trigger_response.path = path;
-      AtomicSet(&g_state.last_vk, vk);
-      AtomicSet(&g_state.last_result, pending->trigger_response.rc);
-      AtomicSet(&g_state.last_error, pending->trigger_response.last_error);
+      CompleteTriggerSlotPending(pending);
       break;
     }
     case kPendingChatSend: {
@@ -2083,8 +2758,8 @@ bool CanRefreshIdentityNow() {
 
 void FillQueryResponse(QueryResponse* response) {
   memset(response, 0, sizeof(*response));
-  DiscoverQuickbarPanel("query");
-  UpdateQuickbarItemMasks();
+  // Keep socket-thread queries passive; quickbar discovery and mask refresh run
+  // on the SDL/main thread when a trigger command is drained.
   if (CanRefreshIdentityNow()) {
     RunRefreshIdentity();
   }
@@ -2093,7 +2768,7 @@ void FillQueryResponse(QueryResponse* response) {
   response->app_global_slot = kAppGlobalSlotAddress;
   response->app_holder = ReadAppHolderPointer();
   response->app_object = ReadAppObjectPointer();
-  response->app_inner = response->app_object;
+  response->app_inner = ReadAppInnerPointer();
   response->quickbar_exec = kQuickbarExec;
   response->quickbar_slot_dispatch = kQuickbarSlotDispatch;
   response->quickbar_panel_vtable = kQuickbarPanelVtable;
@@ -2418,12 +3093,16 @@ void InitHook() {
   if (__sync_lock_test_and_set(&g_state.initialized, 1) != 0) {
     return;
   }
+  g_main_thread = pthread_self();
+  AtomicSet(&g_main_thread_ready, 1);
   pthread_mutex_init(&g_state.log_mutex, nullptr);
   pthread_mutex_init(&g_state.chat_mutex, nullptr);
   pthread_mutex_init(&g_state.overlay_mutex, nullptr);
   pthread_mutex_init(&g_pending_mutex, nullptr);
   pthread_cond_init(&g_pending_cond, nullptr);
   AtomicSet(&g_state.log_level, InitialLogLevel());
+  InstallFaultHandlers();
+  InstallWakeSignalHandler();
   TryInitXThreads();
   EnsureLogReady();
   InstallHooks();
@@ -2463,7 +3142,7 @@ extern "C" __attribute__((constructor)) void SimKeysLinuxConstructor() {
 
 extern "C" void SDL_GL_SwapBuffers() {
   if (g_real_sdl_gl_swap_buffers == nullptr) {
-    g_real_sdl_gl_swap_buffers = reinterpret_cast<SdlGlSwapBuffersFn>(dlsym(RTLD_NEXT, "SDL_GL_SwapBuffers"));
+    g_real_sdl_gl_swap_buffers = reinterpret_cast<SdlGlSwapBuffersFn>(ResolveSdl12Symbol("SDL_GL_SwapBuffers"));
   }
   DrainPendingOnMainThread();
   RenderOverlays();
@@ -2472,14 +3151,43 @@ extern "C" void SDL_GL_SwapBuffers() {
   }
 }
 
+extern "C" void SDL_Delay(uint32_t ms) {
+  if (g_real_sdl_delay == nullptr) {
+    g_real_sdl_delay = reinterpret_cast<SdlDelayFn>(ResolveSdl12Symbol("SDL_Delay"));
+  }
+  DrainPendingOnMainThread();
+  if (g_real_sdl_delay != nullptr) {
+    g_real_sdl_delay(ms);
+  } else {
+    usleep(static_cast<useconds_t>(ms) * 1000u);
+  }
+  DrainPendingOnMainThread();
+}
+
+extern "C" uint8_t SDL_GetAppState() {
+  if (g_real_sdl_get_app_state == nullptr) {
+    g_real_sdl_get_app_state = reinterpret_cast<SdlGetAppStateFn>(ResolveSdl12Symbol("SDL_GetAppState"));
+  }
+
+  uint8_t state = g_real_sdl_get_app_state != nullptr ? g_real_sdl_get_app_state() : kSdlAppActiveMask;
+  if (KeepSdlActiveEnabled()) {
+    state = static_cast<uint8_t>(state | kSdlAppActiveMask);
+  }
+  return state;
+}
+
 extern "C" int SDL_PollEvent(void* event) {
   if (g_real_sdl_poll_event == nullptr) {
-    g_real_sdl_poll_event = reinterpret_cast<SdlPollEventFn>(dlsym(RTLD_NEXT, "SDL_PollEvent"));
+    g_real_sdl_poll_event = reinterpret_cast<SdlPollEventFn>(ResolveSdl12Symbol("SDL_PollEvent"));
   }
   DrainPendingOnMainThread();
   int rc = 0;
-  if (g_real_sdl_poll_event != nullptr) {
+  while (g_real_sdl_poll_event != nullptr) {
     rc = g_real_sdl_poll_event(event);
+    if (rc && FilterSdlInternalEvent(event)) {
+      continue;
+    }
+    break;
   }
   if (rc && event != nullptr) {
     const uint8_t* bytes = static_cast<const uint8_t*>(event);
@@ -2492,6 +3200,37 @@ extern "C" int SDL_PollEvent(void* event) {
       memcpy(&y, bytes + 6, sizeof(y));
       HandleOverlayMouseButton(x, y);
     }
+  }
+  return rc;
+}
+
+extern "C" int SDL_WaitEvent(void* event) {
+  if (g_real_sdl_wait_event == nullptr) {
+    g_real_sdl_wait_event = reinterpret_cast<SdlWaitEventFn>(ResolveSdl12Symbol("SDL_WaitEvent"));
+  }
+  DrainPendingOnMainThread();
+  int rc = 0;
+  while (g_real_sdl_wait_event != nullptr) {
+    rc = g_real_sdl_wait_event(event);
+    if (rc && FilterSdlInternalEvent(event)) {
+      continue;
+    }
+    break;
+  }
+  DrainPendingOnMainThread();
+  return rc;
+}
+
+extern "C" int SDL_PeepEvents(void* events, int numevents, int action, uint32_t mask) {
+  SdlPeepEventsFn peep_events = ResolveSdlPeepEvents();
+  DrainPendingOnMainThread();
+  if (peep_events == nullptr) {
+    return -1;
+  }
+
+  int rc = peep_events(events, numevents, action, mask);
+  if (rc > 0 && action == kSdlGetEvent && events != nullptr) {
+    rc = FilterSdlInternalEvents(events, rc);
   }
   return rc;
 }

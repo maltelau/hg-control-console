@@ -24,19 +24,27 @@ def _prepend_env_path(existing, value):
     return f"{value}:{existing}"
 
 
-def _client_library_dirs(client_dir):
+def _client_library_dirs(client_dir, include_client_lib=True):
     if not client_dir:
         return []
-    candidates = [
-        os.path.join(client_dir, "lib"),
+    candidates = []
+    if include_client_lib:
+        candidates.append(os.path.join(client_dir, "lib"))
+    candidates.extend([
         os.path.join(client_dir, "miles_linux"),
         os.path.join(client_dir, "miles"),
         client_dir,
-    ]
+    ])
     return [path for path in candidates if os.path.isdir(path)]
 
 
-def build_launch_environment(hook_path, socket_dir=None, log_dir=None, client_dir=None):
+def build_launch_environment(
+    hook_path,
+    socket_dir=None,
+    log_dir=None,
+    client_dir=None,
+    include_client_lib=True,
+):
     env = os.environ.copy()
     env["LD_PRELOAD"] = _prepend_env_path(env.get("LD_PRELOAD", ""), hook_path)
     env.setdefault("SDL_MOUSE_RELATIVE", "0")
@@ -51,7 +59,7 @@ def build_launch_environment(hook_path, socket_dir=None, log_dir=None, client_di
         os.makedirs(log_dir, mode=0o700, exist_ok=True)
         env["SIMKEYS_LINUX_LOG_DIR"] = log_dir
 
-    for library_dir in reversed(_client_library_dirs(client_dir)):
+    for library_dir in reversed(_client_library_dirs(client_dir, include_client_lib=include_client_lib)):
         env["LD_LIBRARY_PATH"] = _prepend_env_path(env.get("LD_LIBRARY_PATH", ""), library_dir)
 
     return env
@@ -70,6 +78,7 @@ def build_parser():
     parser.add_argument("--hook", default=runtime.default_dll_path(), help="Path to libSimKeysHookLinux.so.")
     parser.add_argument("--socket-dir", help="Directory for simkeys_<pid>.sock. Default: XDG_RUNTIME_DIR/hgcc or /tmp/hgcc-uid.")
     parser.add_argument("--log-dir", help="Directory for SimKeysHookLinux_<pid>.log.")
+    parser.add_argument("--system-sdl", action="store_true", help="Skip the client's bundled lib directory so nwmain uses the system SDL library.")
     parser.add_argument("--spawn", action="store_true", help="Spawn nwmain and print its pid instead of replacing this process.")
     parser.add_argument("--dry-run", action="store_true", help="Print the command and environment paths without launching.")
     parser.add_argument("client_args", nargs=argparse.REMAINDER, help="Arguments passed to nwmain. Prefix with -- when needed.")
@@ -88,7 +97,13 @@ def main(argv=None):
     if not os.path.isfile(hook):
         raise SystemExit(f"HGCC Linux hook was not found: {hook}")
 
-    env = build_launch_environment(hook, socket_dir=args.socket_dir, log_dir=args.log_dir, client_dir=client_dir)
+    env = build_launch_environment(
+        hook,
+        socket_dir=args.socket_dir,
+        log_dir=args.log_dir,
+        client_dir=client_dir,
+        include_client_lib=not args.system_sdl,
+    )
     command = [nwmain, *client_args]
 
     if args.dry_run:

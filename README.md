@@ -45,11 +45,11 @@ Linux support targets the 32-bit NWN 1.69 Linux client. On Linux, build the prel
 ./simkeys_linux_client.sh --client-dir /path/to/English_linuxclient_xp2
 ```
 
-Use an existing working Linux NWN client. The HGCC launcher mirrors the original `nwn` wrapper by adding `lib`, `miles_linux`, `miles`, and the client directory to `LD_LIBRARY_PATH` when present, and by setting the same SDL mouse compatibility flags.
+Use an existing working Linux NWN client. The HGCC launcher mirrors the original `nwn` wrapper by adding `lib`, `miles_linux`, `miles`, and the client directory to `LD_LIBRARY_PATH` when present, and by setting the same SDL mouse compatibility flags. Pass `--system-sdl` if that client should use the distro SDL library instead of the bundled `lib` directory.
 
 Then run the Python GUI on the same Linux session and it will discover `nwmain` clients through `simkeys_<pid>.sock`.
 
-The Linux hook provides the same HGCC operations as the Windows hook: quickbar slots, chat send/capture, overlays, player identity, position, movement, walk bypass, and action-mode toggles. Already-running Linux clients are not injected; launch them with `simkeys_linux_client.sh`.
+The Linux hook provides the same HGCC command operations as the Windows hook: quickbar slots, chat send, overlay requests, player identity, position, movement, walk bypass, and action-mode toggles. Linux in-client OpenGL overlay drawing is opt-in with `SIMKEYS_LINUX_ENABLE_OVERLAY=1`; overlay requests still succeed by default so the GUI can run safely on X11/GL stacks that terminate the client during overlay setup. Passive Linux quickbar/chat tracing is also opt-in (`SIMKEYS_LINUX_ENABLE_QUICKBAR_TRACE=1` and `SIMKEYS_LINUX_ENABLE_CHAT_TRACE=1`) because the command path can discover quickbar state on demand without detouring load-time client code. Already-running Linux clients are not injected; launch them with `simkeys_linux_client.sh`.
 
 ## Requirements
 
