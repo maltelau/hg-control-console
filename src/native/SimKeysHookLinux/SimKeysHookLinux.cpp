@@ -24,6 +24,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #ifndef RTLD_NOLOAD
@@ -98,6 +99,7 @@ constexpr uint32_t kSetActionMode = 0x08315B2Cu;
 constexpr uint32_t kGetActionMode = 0x08305538u;
 constexpr uint32_t kPlayerNameBuilder = 0x08138B68u;
 constexpr uint32_t kNwnStringDestroy = 0x085A61DCu;
+constexpr uint32_t kCurrentPlayerGlobalAddress = 0x0862EF18u;
 
 constexpr uint32_t kQuickbarPanelVtableOffset = 0x20u;
 constexpr uint32_t kQuickbarPanelSlotsOffset = 0x74u;
@@ -109,6 +111,7 @@ constexpr uint32_t kQuickbarSlotPrimaryItemOffset = 0x6Cu;
 constexpr uint32_t kQuickbarSlotSecondaryItemOffset = 0x70u;
 constexpr uint32_t kQuickbarSlotTypeOffset = 0xA0u;
 constexpr uint32_t kCurrentPlayerObjectIdOffset = 0x24u;
+constexpr uint32_t kPlayerCreatureOffset = 0x2BCu;
 constexpr uint8_t kQuickbarItemSlotType = 1u;
 constexpr int kQuickbarPageCount = 3;
 constexpr int kQuickbarSlotCount = 12;
@@ -160,15 +163,6 @@ constexpr int kSdlGetEvent = 2;
 constexpr int32_t kSdlWakeEventCode = 0x534B574Bu;  // SKWK
 constexpr uint8_t kSdlActiveMask = 0x07u;
 constexpr uint8_t kSdlAppActiveMask = 0x07u;
-constexpr uint8_t kSdlKeyDownEvent = 2;
-constexpr uint8_t kSdlKeyUpEvent = 3;
-constexpr uint8_t kSdlPressed = 1;
-constexpr uint8_t kSdlReleased = 0;
-constexpr int32_t kSdlKeyF1 = 282;
-constexpr int32_t kSdlKeyLeftShift = 304;
-constexpr int32_t kSdlKeyLeftCtrl = 306;
-constexpr int32_t kSdlModShift = 0x0003;
-constexpr int32_t kSdlModCtrl = 0x00C0;
 
 #pragma pack(push, 1)
 struct PipeHeader {
@@ -520,6 +514,8 @@ struct FaultGuard {
   sigjmp_buf jump;
   FaultGuard* previous;
   int signal_number;
+  uintptr_t instruction_pointer;
+  uintptr_t fault_address;
 };
 
 __thread FaultGuard* g_active_fault_guard = nullptr;
@@ -605,10 +601,19 @@ const struct sigaction* PreviousFaultAction(int signal_number) {
   }
 }
 
-void FaultSignalHandler(int signal_number, siginfo_t*, void*) {
+void FaultSignalHandler(int signal_number, siginfo_t* info, void* context) {
   FaultGuard* guard = g_active_fault_guard;
   if (guard != nullptr) {
     guard->signal_number = signal_number;
+    guard->fault_address = info != nullptr ? reinterpret_cast<uintptr_t>(info->si_addr) : 0;
+#if defined(__i386__) && defined(REG_EIP)
+    const ucontext_t* ucontext = reinterpret_cast<const ucontext_t*>(context);
+    if (ucontext != nullptr) {
+      guard->instruction_pointer = static_cast<uintptr_t>(ucontext->uc_mcontext.gregs[REG_EIP]);
+    }
+#else
+    (void)context;
+#endif
     siglongjmp(guard->jump, 1);
   }
 
@@ -650,7 +655,11 @@ void InstallWakeSignalHandler() {
 }
 
 template <typename Fn>
-bool RunWithFaultGuard(Fn fn, int* out_signal) {
+bool RunWithFaultGuard(
+    Fn fn,
+    int* out_signal,
+    uintptr_t* out_instruction_pointer = nullptr,
+    uintptr_t* out_fault_address = nullptr) {
   FaultGuard guard = {};
   guard.previous = g_active_fault_guard;
   g_active_fault_guard = &guard;
@@ -663,6 +672,12 @@ bool RunWithFaultGuard(Fn fn, int* out_signal) {
     if (out_signal != nullptr) {
       *out_signal = guard.signal_number;
     }
+    if (out_instruction_pointer != nullptr) {
+      *out_instruction_pointer = guard.instruction_pointer;
+    }
+    if (out_fault_address != nullptr) {
+      *out_fault_address = guard.fault_address;
+    }
     errno = EFAULT;
     return false;
   }
@@ -670,6 +685,22 @@ bool RunWithFaultGuard(Fn fn, int* out_signal) {
     *out_signal = 0;
   }
   return true;
+}
+
+// Keep NWN text addresses as runtime immediates; PIC can otherwise fold a
+// constant function pointer call into a .so-relative direct call.
+__attribute__((noinline)) uintptr_t AbsoluteNwnAddress(uint32_t address) {
+  volatile uintptr_t resolved = static_cast<uintptr_t>(address);
+  return resolved;
+}
+
+template <typename Fn>
+Fn NwnFunction(uint32_t address) {
+  return reinterpret_cast<Fn>(AbsoluteNwnAddress(address));
+}
+
+void* NwnPointer(uint32_t address) {
+  return reinterpret_cast<void*>(AbsoluteNwnAddress(address));
 }
 
 void NudgeMainThreadForPending() {
@@ -747,7 +778,6 @@ bool FilterSdlInternalEvent(void* event) {
   if (IsSimKeysWakeEvent(event)) {
     AtomicIncrement(&g_state.pending_wake_swallowed);
     AtomicSet(&g_sdl_wake_event_queued, 0);
-    DrainPendingOnMainThread();
     return true;
   }
 
@@ -1080,6 +1110,11 @@ uint32_t ReadAppObjectPointer() {
   return holder != 0 ? SafeReadPointer32(holder) : 0;
 }
 
+uint32_t ReadServerAppObjectPointer() {
+  const uint32_t holder = ReadAppHolderPointer();
+  return holder != 0 ? SafeReadPointer32(static_cast<uintptr_t>(holder) + 4u) : 0;
+}
+
 uint32_t ReadAppInnerPointer() {
   const uint32_t app_object = ReadAppObjectPointer();
   return app_object != 0 ? SafeReadPointer32(static_cast<uintptr_t>(app_object) + 4u) : 0;
@@ -1093,6 +1128,10 @@ uint32_t ReadCurrentPlayerObjectId() {
 uint32_t ReadCurrentGuiPointer() {
   const uint32_t app_inner = ReadAppInnerPointer();
   return app_inner != 0 ? SafeReadPointer32(static_cast<uintptr_t>(app_inner) + 0x48u) : 0;
+}
+
+uint32_t ReadCurrentPlayerGlobalPointer() {
+  return SafeReadPointer32(kCurrentPlayerGlobalAddress);
 }
 
 bool IsQuickbarPanel(uint32_t panel) {
@@ -1463,7 +1502,7 @@ bool CallQuickbarPageSelectDirect(int32_t page_index, int32_t* out_resolved_page
   }
 
   typedef void (*QuickbarPageSelectFn)(void*, int32_t);
-  const QuickbarPageSelectFn fn = reinterpret_cast<QuickbarPageSelectFn>(kQuickbarPageSelect);
+  const QuickbarPageSelectFn fn = NwnFunction<QuickbarPageSelectFn>(kQuickbarPageSelect);
   int signal_number = 0;
   if (!RunWithFaultGuard(
           [&]() {
@@ -1531,20 +1570,27 @@ int32_t CallQuickbarExecDirect(int32_t slot_index) {
   }
 
   typedef int32_t (*QuickbarExecFn)(void*, int32_t);
-  const QuickbarExecFn fn = reinterpret_cast<QuickbarExecFn>(kQuickbarExec);
+  const QuickbarExecFn fn = NwnFunction<QuickbarExecFn>(kQuickbarExec);
   int32_t native_rc = 0;
   int signal_number = 0;
+  uintptr_t fault_ip = 0;
+  uintptr_t fault_address = 0;
   if (!RunWithFaultGuard(
           [&]() {
             native_rc = fn(reinterpret_cast<void*>(panel), slot_index);
           },
-          &signal_number)) {
+          &signal_number,
+          &fault_ip,
+          &fault_address)) {
     LogMessage(
         kLogDebug,
-        "quickbar exec faulted signal=%d panel=0x%08X slot=%d",
+        "quickbar exec faulted signal=%d ip=0x%08X addr=0x%08X panel=0x%08X slot=%d slotPtr=0x%08X",
         signal_number,
+        static_cast<uint32_t>(fault_ip),
+        static_cast<uint32_t>(fault_address),
         panel,
-        slot_index);
+        slot_index,
+        slot_ptr);
     errno = EFAULT;
     return 0;
   }
@@ -1628,7 +1674,7 @@ int32_t CallChatSendDirect(const char* text, int32_t mode) {
   message.text = const_cast<char*>(text);
   message.length = static_cast<int32_t>(strnlen(text, kPendingChatCapacity));
   typedef void (*ChatSendFn)(const void*, int32_t);
-  reinterpret_cast<ChatSendFn>(kChatSend)(&message, mode);
+  NwnFunction<ChatSendFn>(kChatSend)(&message, mode);
   AtomicSet(&g_state.last_chat_mode, mode);
   AtomicSet(&g_state.last_chat_result, 1);
   AtomicSet(&g_state.last_chat_error, 0);
@@ -1687,7 +1733,7 @@ int32_t CallMoveToLocationDirect(float x, float y, float z, int32_t client_side,
   }
   typedef int32_t (*WalkFn)(void*, float, float, float, int32_t, uint32_t, int32_t);
   const uint32_t resolved_action = action_object_id != 0 ? action_object_id : kInvalidObjectId;
-  const int32_t rc = reinterpret_cast<WalkFn>(kWalkToWaypoint)(
+  const int32_t rc = NwnFunction<WalkFn>(kWalkToWaypoint)(
       reinterpret_cast<void*>(app_object),
       x,
       y,
@@ -1701,14 +1747,31 @@ int32_t CallMoveToLocationDirect(float x, float y, float z, int32_t client_side,
   return rc;
 }
 
+uint32_t ResolveCreatureFromPlayerObject(uint32_t player_object) {
+  if (player_object == 0 || !RangeIsMapped(player_object, kPlayerCreatureOffset + sizeof(uint32_t), false)) {
+    return 0;
+  }
+  const uint32_t creature = SafeReadPointer32(static_cast<uintptr_t>(player_object) + kPlayerCreatureOffset);
+  return RangeIsMapped(creature, 0x20u, false) ? creature : 0;
+}
+
+uint32_t ResolveCurrentPlayerGlobal() {
+  const uint32_t player_object = ReadCurrentPlayerGlobalPointer();
+  if (ResolveCreatureFromPlayerObject(player_object) == 0) {
+    return 0;
+  }
+  return player_object;
+}
+
 uint32_t ResolveCurrentClientPlayer() {
   const uint32_t app_object = ReadAppObjectPointer();
+  const uint32_t fallback_player = ResolveCurrentPlayerGlobal();
   if (app_object == 0) {
-    return 0;
+    return fallback_player;
   }
   const uint32_t object_id = ReadCurrentPlayerObjectId();
   if (!IsValidObjectId(object_id)) {
-    return 0;
+    return fallback_player;
   }
   typedef void* (*ResolverFn)(void*);
   uint32_t result = 0;
@@ -1716,13 +1779,13 @@ uint32_t ResolveCurrentClientPlayer() {
   if (!RunWithFaultGuard(
           [&]() {
             result = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
-                reinterpret_cast<ResolverFn>(kCurrentClientPlayerResolver)(reinterpret_cast<void*>(app_object))));
+                NwnFunction<ResolverFn>(kCurrentClientPlayerResolver)(reinterpret_cast<void*>(app_object))));
           },
           &signal_number)) {
     LogMessage(kLogDebug, "current player resolver faulted signal=%d appObject=0x%08X", signal_number, app_object);
-    return 0;
+    return fallback_player;
   }
-  return result;
+  return result != 0 ? result : fallback_player;
 }
 
 uint32_t ResolveCurrentServerCreature(uint32_t* out_game_object) {
@@ -1730,16 +1793,16 @@ uint32_t ResolveCurrentServerCreature(uint32_t* out_game_object) {
     *out_game_object = 0;
   }
   const uint32_t object_id = ReadCurrentPlayerObjectId();
-  const uint32_t server_app = ReadAppObjectPointer();
+  const uint32_t server_app = ReadServerAppObjectPointer();
   if (!IsValidObjectId(object_id) || server_app == 0) {
-    return 0;
+    return ResolveCreatureFromPlayerObject(ResolveCurrentClientPlayer());
   }
   typedef void* (*ObjectByIdFn)(void*, uint32_t);
   void* game_object = nullptr;
   int signal_number = 0;
   if (!RunWithFaultGuard(
           [&]() {
-            game_object = reinterpret_cast<ObjectByIdFn>(kServerObjectByIdResolver)(
+            game_object = NwnFunction<ObjectByIdFn>(kServerObjectByIdResolver)(
                 reinterpret_cast<void*>(server_app),
                 object_id);
           },
@@ -1750,10 +1813,10 @@ uint32_t ResolveCurrentServerCreature(uint32_t* out_game_object) {
         signal_number,
         server_app,
         object_id);
-    return 0;
+    return ResolveCreatureFromPlayerObject(ResolveCurrentClientPlayer());
   }
   if (game_object == nullptr) {
-    return 0;
+    return ResolveCreatureFromPlayerObject(ResolveCurrentClientPlayer());
   }
   if (out_game_object != nullptr) {
     *out_game_object = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(game_object));
@@ -1761,7 +1824,7 @@ uint32_t ResolveCurrentServerCreature(uint32_t* out_game_object) {
   const uint32_t vtable = SafeReadPointer32(reinterpret_cast<uintptr_t>(game_object));
   const uint32_t as_creature_ptr = vtable != 0 ? SafeReadPointer32(vtable + kObjectAsCreatureVtableOffset) : 0;
   if (as_creature_ptr == 0 || !RangeIsExecutable(as_creature_ptr, 1)) {
-    return 0;
+    return ResolveCreatureFromPlayerObject(ResolveCurrentClientPlayer());
   }
   typedef void* (*AsCreatureFn)(void*);
   uint32_t creature = 0;
@@ -1777,9 +1840,9 @@ uint32_t ResolveCurrentServerCreature(uint32_t* out_game_object) {
         signal_number,
         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(game_object)),
         as_creature_ptr);
-    return 0;
+    return ResolveCreatureFromPlayerObject(ResolveCurrentClientPlayer());
   }
-  return creature;
+  return creature != 0 ? creature : ResolveCreatureFromPlayerObject(ResolveCurrentClientPlayer());
 }
 
 bool BuildCurrentPlayerName(uint32_t client_player, char* out, size_t capacity) {
@@ -1793,15 +1856,15 @@ bool BuildCurrentPlayerName(uint32_t client_player, char* out, size_t capacity) 
   }
   out[0] = '\0';
   if (client_player == 0 ||
-      !RangeIsMapped(client_player, 0x2C0u, false) ||
-      !RangeIsMapped(SafeReadPointer32(client_player + 0x2BCu), 0x20u, false)) {
+      !RangeIsMapped(client_player, kPlayerCreatureOffset + sizeof(uint32_t), false) ||
+      ResolveCreatureFromPlayerObject(client_player) == 0) {
     return false;
   }
 
   NwnStringRef name = {};
 #if defined(__i386__)
   void* ignored = nullptr;
-  void* const fn = reinterpret_cast<void*>(kPlayerNameBuilder);
+  void* const fn = NwnPointer(kPlayerNameBuilder);
   int signal_number = 0;
   if (!RunWithFaultGuard(
           [&]() {
@@ -1829,13 +1892,36 @@ bool BuildCurrentPlayerName(uint32_t client_player, char* out, size_t capacity) 
     int destroy_signal = 0;
     if (!RunWithFaultGuard(
             [&]() {
-              reinterpret_cast<DestroyNwnStringFn>(kNwnStringDestroy)(&name, 2);
+              NwnFunction<DestroyNwnStringFn>(kNwnStringDestroy)(&name, 2);
             },
             &destroy_signal)) {
       LogMessage(kLogDebug, "NWN string destroy faulted signal=%d namePtr=0x%08X", destroy_signal, reinterpret_cast<uint32_t>(name.text));
     }
   }
   return ok;
+}
+
+bool BuildCreatureName(uint32_t creature, char* out, size_t capacity) {
+  if (out == nullptr || capacity == 0) {
+    return false;
+  }
+  out[0] = '\0';
+  if (creature == 0 || !RangeIsMapped(creature, 0x20u, false)) {
+    return false;
+  }
+
+  char first[64] = {};
+  char last[64] = {};
+  SafeReadString(reinterpret_cast<const void*>(static_cast<uintptr_t>(creature) + 0x10u), first, sizeof(first));
+  SafeReadString(reinterpret_cast<const void*>(static_cast<uintptr_t>(creature) + 0x18u), last, sizeof(last));
+  if (first[0] != '\0' && last[0] != '\0') {
+    snprintf(out, capacity, "%s %s", first, last);
+  } else if (first[0] != '\0') {
+    snprintf(out, capacity, "%s", first);
+  } else if (last[0] != '\0') {
+    snprintf(out, capacity, "%s", last);
+  }
+  return out[0] != '\0';
 }
 
 bool RefreshCharacterIdentity(int32_t* out_error) {
@@ -1848,7 +1934,16 @@ bool RefreshCharacterIdentity(int32_t* out_error) {
   float position_y = 0.0f;
   float position_z = 0.0f;
 
-  if (client_player != 0) {
+  const uint32_t player_creature = ResolveCreatureFromPlayerObject(client_player);
+  if (creature == 0) {
+    creature = player_creature;
+  }
+
+  if (creature != 0) {
+    BuildCreatureName(creature, name, sizeof(name));
+  }
+
+  if (name[0] == '\0' && client_player != 0) {
     BuildCurrentPlayerName(client_player, name, sizeof(name));
   }
 
@@ -1947,8 +2042,8 @@ bool SetActionModeOnMain(int32_t mode, int32_t enabled, int32_t* out_active, int
   }
   typedef void (*SetModeFn)(void*, uint8_t, int32_t);
   typedef int32_t (*GetModeFn)(void*, uint8_t);
-  reinterpret_cast<SetModeFn>(kSetActionMode)(reinterpret_cast<void*>(creature), static_cast<uint8_t>(mode), enabled ? 1 : 0);
-  const int32_t active = reinterpret_cast<GetModeFn>(kGetActionMode)(reinterpret_cast<void*>(creature), static_cast<uint8_t>(mode));
+  NwnFunction<SetModeFn>(kSetActionMode)(reinterpret_cast<void*>(creature), static_cast<uint8_t>(mode), enabled ? 1 : 0);
+  const int32_t active = NwnFunction<GetModeFn>(kGetActionMode)(reinterpret_cast<void*>(creature), static_cast<uint8_t>(mode));
   if (out_active != nullptr) {
     *out_active = active;
   }
@@ -2481,7 +2576,7 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
       "hook: log=%s\n"
       "hook: installed=%d logLevel=%d pipeState=%d pipeErr=%d\n"
       "expected: quickbarExec=0x%08X quickbarPageSelect=0x%08X slotDispatch=0x%08X quickbarVtable=0x%08X chatSend=0x%08X chatWindowLog=0x%08X\n"
-      "engine: appGlobalSlot=0x%08X appHolder=0x%08X appObject=0x%08X appInner=0x%08X currentObjectId=0x%08X\n"
+      "engine: appGlobalSlot=0x%08X appHolder=0x%08X appObject=0x%08X serverApp=0x%08X appInner=0x%08X currentObjectId=0x%08X currentPlayerGlobal=0x%08X\n"
       "pending: busy=%d kind=%d done=%d drains=%d wakeAttempts=%d wakeSuccess=%d wakeSwallowed=%d signalAttempts=%d signalSuccess=%d focusLossSwallowed=%d\n"
       "quickbar: execTrace=%d slotTrace=%d capturedThis=0x%08X page=%d capturedSlot=%d slotPtr=0x%08X slotType=%d calls=%d scanAttempts=%d scanHits=%d itemMask=0x%08X%08X equippedMask=0x%08X%08X\n"
       "chat: trace=%d queued=%d nextWrite=%d latestSeq=%d lastMode=%d lastRc=%d lastErr=%d\n"
@@ -2507,8 +2602,10 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
       kAppGlobalSlotAddress,
       ReadAppHolderPointer(),
       ReadAppObjectPointer(),
+      ReadServerAppObjectPointer(),
       ReadAppInnerPointer(),
       ReadCurrentPlayerObjectId(),
+      ReadCurrentPlayerGlobalPointer(),
       pending_busy,
       pending_kind,
       pending_done,
@@ -2564,55 +2661,6 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
       g_state.last_error);
 }
 
-void BuildSdlKeyEvent(uint8_t* event, uint8_t type, uint8_t state, int32_t sym, int32_t mod) {
-  memset(event, 0, kSdlEventSize);
-  event[0] = type;
-  event[2] = state;
-  memcpy(event + 8, &sym, sizeof(sym));
-  memcpy(event + 12, &mod, sizeof(mod));
-}
-
-bool PushSdlKeyEvent(uint8_t type, uint8_t state, int32_t sym, int32_t mod) {
-  SdlPushEventFn push_event = ResolveSdlPushEvent();
-  if (push_event == nullptr) {
-    errno = ENOSYS;
-    return false;
-  }
-
-  uint8_t event[kSdlEventSize] = {};
-  BuildSdlKeyEvent(event, type, state, sym, mod);
-  if (push_event(event) != 0) {
-    errno = EIO;
-    return false;
-  }
-  return true;
-}
-
-bool PushQuickbarKeyEvents(int32_t page, int32_t slot) {
-  if (slot < 1 || slot > kQuickbarSlotCount || page < 0 || page >= kQuickbarPageCount) {
-    errno = EINVAL;
-    return false;
-  }
-
-  const int32_t key_sym = kSdlKeyF1 + slot - 1;
-  const int32_t modifier_sym = page == 1 ? kSdlKeyLeftShift : (page == 2 ? kSdlKeyLeftCtrl : 0);
-  const int32_t modifier_mask = page == 1 ? kSdlModShift : (page == 2 ? kSdlModCtrl : 0);
-
-  if (modifier_sym != 0 && !PushSdlKeyEvent(kSdlKeyDownEvent, kSdlPressed, modifier_sym, modifier_mask)) {
-    return false;
-  }
-  if (!PushSdlKeyEvent(kSdlKeyDownEvent, kSdlPressed, key_sym, modifier_mask)) {
-    return false;
-  }
-  if (!PushSdlKeyEvent(kSdlKeyUpEvent, kSdlReleased, key_sym, modifier_mask)) {
-    return false;
-  }
-  if (modifier_sym != 0 && !PushSdlKeyEvent(kSdlKeyUpEvent, kSdlReleased, modifier_sym, 0)) {
-    return false;
-  }
-  return true;
-}
-
 void CompleteTriggerSlotPending(PendingCommand* pending) {
   if (pending == nullptr) {
     return;
@@ -2621,13 +2669,12 @@ void CompleteTriggerSlotPending(PendingCommand* pending) {
   int32_t aux_rc = -1;
   int32_t path = 0;
   pending->trigger_response.vk = vk;
-  int32_t rc = CallQuickbarPageSlotDirect(pending->page, pending->slot, &aux_rc, &path);
-  int32_t last_error = rc ? 0 : errno;
-  if (!rc && PushQuickbarKeyEvents(pending->page, pending->slot)) {
-    rc = 1;
-    last_error = 0;
-    path = 4;
-  }
+  int32_t rc = 0;
+  int32_t last_error = 0;
+
+  rc = CallQuickbarPageSlotDirect(pending->page, pending->slot, &aux_rc, &path);
+  last_error = rc ? 0 : errno;
+
   pending->trigger_response.rc = rc;
   pending->trigger_response.success = pending->trigger_response.rc ? 1 : 0;
   pending->trigger_response.aux_rc = aux_rc;
@@ -3166,7 +3213,6 @@ extern "C" void SDL_Delay(uint32_t ms) {
   if (g_real_sdl_delay == nullptr) {
     g_real_sdl_delay = reinterpret_cast<SdlDelayFn>(ResolveSdl12Symbol("SDL_Delay"));
   }
-  DrainPendingOnMainThread();
   if (g_real_sdl_delay != nullptr) {
     g_real_sdl_delay(ms);
   } else {
@@ -3191,7 +3237,6 @@ extern "C" int SDL_PollEvent(void* event) {
   if (g_real_sdl_poll_event == nullptr) {
     g_real_sdl_poll_event = reinterpret_cast<SdlPollEventFn>(ResolveSdl12Symbol("SDL_PollEvent"));
   }
-  DrainPendingOnMainThread();
   int rc = 0;
   while (g_real_sdl_poll_event != nullptr) {
     rc = g_real_sdl_poll_event(event);
@@ -3219,7 +3264,6 @@ extern "C" int SDL_WaitEvent(void* event) {
   if (g_real_sdl_wait_event == nullptr) {
     g_real_sdl_wait_event = reinterpret_cast<SdlWaitEventFn>(ResolveSdl12Symbol("SDL_WaitEvent"));
   }
-  DrainPendingOnMainThread();
   int rc = 0;
   while (g_real_sdl_wait_event != nullptr) {
     rc = g_real_sdl_wait_event(event);
@@ -3234,7 +3278,6 @@ extern "C" int SDL_WaitEvent(void* event) {
 
 extern "C" int SDL_PeepEvents(void* events, int numevents, int action, uint32_t mask) {
   SdlPeepEventsFn peep_events = ResolveSdlPeepEvents();
-  DrainPendingOnMainThread();
   if (peep_events == nullptr) {
     return -1;
   }
