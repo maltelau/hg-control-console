@@ -39,23 +39,32 @@ extern "C" __attribute__((visibility("hidden"))) void SimKeysLinuxCaptureChatWin
 
 struct _XDisplay;
 typedef _XDisplay Display;
-typedef unsigned long Font;
+typedef unsigned long Window;
+typedef unsigned long Colormap;
+typedef unsigned long Cursor;
 typedef unsigned int GLenum;
 typedef unsigned int GLuint;
 typedef unsigned int GLbitfield;
+typedef unsigned char GLboolean;
 typedef int GLint;
 typedef int GLsizei;
 
 constexpr GLenum GL_QUADS = 0x0007u;
 constexpr GLenum GL_UNSIGNED_BYTE = 0x1401u;
 constexpr GLenum GL_VIEWPORT = 0x0BA2u;
+constexpr GLenum GL_CULL_FACE = 0x0B44u;
 constexpr GLenum GL_DEPTH_TEST = 0x0B71u;
+constexpr GLenum GL_DEPTH_WRITEMASK = 0x0B72u;
 constexpr GLenum GL_BLEND = 0x0BE2u;
 constexpr GLenum GL_TEXTURE_2D = 0x0DE1u;
+constexpr GLenum GL_TEXTURE_BINDING_2D = 0x8069u;
+constexpr GLenum GL_MATRIX_MODE = 0x0BA0u;
 constexpr GLenum GL_MODELVIEW = 0x1700u;
 constexpr GLenum GL_PROJECTION = 0x1701u;
 constexpr GLenum GL_SRC_ALPHA = 0x0302u;
 constexpr GLenum GL_ONE_MINUS_SRC_ALPHA = 0x0303u;
+constexpr GLenum GL_RGBA = 0x1908u;
+constexpr GLenum GL_UNPACK_ALIGNMENT = 0x0CF5u;
 constexpr GLbitfield GL_CURRENT_BIT = 0x00000001u;
 constexpr GLbitfield GL_ENABLE_BIT = 0x00002000u;
 constexpr GLbitfield GL_TRANSFORM_BIT = 0x00001000u;
@@ -142,6 +151,8 @@ constexpr int kOverlayControlButtonSize = 22;
 constexpr int kOverlayControlGap = 4;
 constexpr int kOverlayControlPadding = 3;
 constexpr int kOverlayTextPadding = 6;
+constexpr int kOverlayMaxDimension = 1024;
+constexpr int kOverlayLineColorMarkerLength = 8;
 constexpr char kOverlayControlMarker = '\x1D';
 constexpr char kOverlayEventMarker = '\x1E';
 constexpr char kOverlayLineColorMarker = '\x1F';
@@ -453,40 +464,29 @@ void* g_chat_log_gateway = nullptr;
 uint8_t g_walk_no_walk_original[8] = {};
 bool g_walk_no_walk_bypass_installed = false;
 
-Display* g_x_display = nullptr;
-Font g_x_font = 0;
-GLuint g_gl_font_base = 0;
-int g_gl_font_ready = 0;
-
 struct GraphicsApi {
-  Display* (*XOpenDisplay)(const char*);
-  Font (*XLoadFont)(Display*, const char*);
-  GLuint (*glGenLists)(GLsizei);
-  void (*glXUseXFont)(Font, int, int, int);
-  void (*glColor4f)(float, float, float, float);
-  void (*glBegin)(GLenum);
-  void (*glVertex2f)(float, float);
-  void (*glEnd)();
-  void (*glRasterPos2i)(int, int);
-  void (*glListBase)(GLuint);
-  void (*glCallLists)(GLsizei, GLenum, const void*);
   void (*glGetIntegerv)(GLenum, GLint*);
-  void (*glPushAttrib)(GLbitfield);
+  GLboolean (*glIsEnabled)(GLenum);
   void (*glDisable)(GLenum);
   void (*glEnable)(GLenum);
   void (*glBlendFunc)(GLenum, GLenum);
+  void (*glDepthMask)(GLboolean);
+  void (*glColor3f)(float, float, float);
   void (*glMatrixMode)(GLenum);
   void (*glPushMatrix)();
   void (*glLoadIdentity)();
-  void (*glOrtho)(double, double, double, double, double, double);
   void (*glPopMatrix)();
-  void (*glPopAttrib)();
+  void (*glBindTexture)(GLenum, GLuint);
+  void (*glRasterPos2f)(float, float);
+  void (*glDrawPixels)(GLsizei, GLsizei, GLenum, GLenum, const void*);
+  void (*glPixelStorei)(GLenum, GLint);
 };
 
 GraphicsApi g_graphics = {};
 int g_graphics_ready = 0;
 int g_graphics_failed = 0;
 int32_t g_overlay_render_failed = 0;
+void* g_libgl_handle = nullptr;
 
 typedef void (*SdlGlSwapBuffersFn)();
 typedef int (*SdlPollEventFn)(void*);
@@ -495,6 +495,8 @@ typedef void (*SdlDelayFn)(uint32_t);
 typedef int (*SdlPushEventFn)(void*);
 typedef int (*SdlPeepEventsFn)(void*, int, int, uint32_t);
 typedef uint8_t (*SdlGetAppStateFn)();
+typedef void* (*SdlGetVideoSurfaceFn)();
+typedef int (*SdlGetWmInfoFn)(void*);
 SdlGlSwapBuffersFn g_real_sdl_gl_swap_buffers = nullptr;
 SdlPollEventFn g_real_sdl_poll_event = nullptr;
 SdlWaitEventFn g_real_sdl_wait_event = nullptr;
@@ -502,7 +504,10 @@ SdlDelayFn g_real_sdl_delay = nullptr;
 SdlPushEventFn g_real_sdl_push_event = nullptr;
 SdlPeepEventsFn g_real_sdl_peep_events = nullptr;
 SdlGetAppStateFn g_real_sdl_get_app_state = nullptr;
+SdlGetVideoSurfaceFn g_real_sdl_get_video_surface = nullptr;
+SdlGetWmInfoFn g_real_sdl_get_wm_info = nullptr;
 void* g_sdl12_handle = nullptr;
+void* g_x11_handle = nullptr;
 int32_t g_sdl_wake_event_queued = 0;
 pthread_t g_main_thread = {};
 int32_t g_main_thread_ready = 0;
@@ -566,14 +571,22 @@ bool OverlayRenderingEnabled() {
     return cached != 0;
   }
 
+  const char* disable = getenv("SIMKEYS_LINUX_DISABLE_OVERLAY");
+  bool enabled = !(disable != nullptr &&
+      disable[0] != '\0' &&
+      (disable[0] == '1' ||
+       disable[0] == 't' ||
+       disable[0] == 'T' ||
+       disable[0] == 'y' ||
+       disable[0] == 'Y'));
   const char* value = getenv("SIMKEYS_LINUX_ENABLE_OVERLAY");
-  const bool enabled = value != nullptr &&
-      value[0] != '\0' &&
-      value[0] != '0' &&
-      value[0] != 'f' &&
-      value[0] != 'F' &&
-      value[0] != 'n' &&
-      value[0] != 'N';
+  if (value != nullptr && value[0] != '\0') {
+    enabled = value[0] != '0' &&
+        value[0] != 'f' &&
+        value[0] != 'F' &&
+        value[0] != 'n' &&
+        value[0] != 'N';
+  }
   AtomicSet(&g_overlay_render_enabled, enabled ? 1 : 0);
   return enabled;
 }
@@ -742,6 +755,232 @@ void* ResolveSdl12Symbol(const char* name) {
     }
   }
   return dlsym(RTLD_NEXT, name);
+}
+
+bool GetSdlVideoSurfaceSize(int* out_width, int* out_height) {
+  if (out_width != nullptr) {
+    *out_width = 0;
+  }
+  if (out_height != nullptr) {
+    *out_height = 0;
+  }
+  if (g_real_sdl_get_video_surface == nullptr) {
+    g_real_sdl_get_video_surface =
+        reinterpret_cast<SdlGetVideoSurfaceFn>(ResolveSdl12Symbol("SDL_GetVideoSurface"));
+  }
+  if (g_real_sdl_get_video_surface == nullptr) {
+    return false;
+  }
+
+  void* surface = g_real_sdl_get_video_surface();
+  if (surface == nullptr) {
+    return false;
+  }
+
+  struct SdlSurfaceHeader {
+    uint32_t flags;
+    void* format;
+    int width;
+    int height;
+  };
+  const SdlSurfaceHeader* header = static_cast<const SdlSurfaceHeader*>(surface);
+  if (header->width <= 0 || header->height <= 0 ||
+      header->width > 10000 || header->height > 10000) {
+    return false;
+  }
+  if (out_width != nullptr) {
+    *out_width = header->width;
+  }
+  if (out_height != nullptr) {
+    *out_height = header->height;
+  }
+  return true;
+}
+
+struct SdlVersion {
+  uint8_t major;
+  uint8_t minor;
+  uint8_t patch;
+};
+
+struct SdlSysWmInfo {
+  SdlVersion version;
+  int subsystem;
+  union {
+    struct {
+      Display* display;
+      Window window;
+      void (*lock_func)();
+      void (*unlock_func)();
+      Window fswindow;
+      Window wmwindow;
+      Display* gfxdisplay;
+    } x11;
+  } info;
+};
+
+bool GetSdlX11Window(Display** out_display, Window* out_window) {
+  if (out_display != nullptr) {
+    *out_display = nullptr;
+  }
+  if (out_window != nullptr) {
+    *out_window = 0;
+  }
+  if (g_real_sdl_get_wm_info == nullptr) {
+    g_real_sdl_get_wm_info =
+        reinterpret_cast<SdlGetWmInfoFn>(ResolveSdl12Symbol("SDL_GetWMInfo"));
+  }
+  if (g_real_sdl_get_wm_info == nullptr) {
+    return false;
+  }
+
+  SdlSysWmInfo wm_info = {};
+  wm_info.version.major = 1;
+  wm_info.version.minor = 2;
+  wm_info.version.patch = 0;
+  if (!g_real_sdl_get_wm_info(&wm_info) ||
+      wm_info.info.x11.display == nullptr ||
+      wm_info.info.x11.window == 0) {
+    return false;
+  }
+  if (out_display != nullptr) {
+    *out_display = wm_info.info.x11.display;
+  }
+  if (out_window != nullptr) {
+    *out_window = wm_info.info.x11.window;
+  }
+  return true;
+}
+
+void* ResolveX11Symbol(const char* name) {
+  void* symbol = dlsym(RTLD_DEFAULT, name);
+  if (symbol != nullptr) {
+    return symbol;
+  }
+  if (g_x11_handle == nullptr) {
+    g_x11_handle = dlopen("libX11.so.6", RTLD_LAZY | RTLD_GLOBAL);
+  }
+  return g_x11_handle != nullptr ? dlsym(g_x11_handle, name) : nullptr;
+}
+
+bool GetSdlWindowSize(int* out_width, int* out_height) {
+  if (out_width != nullptr) {
+    *out_width = 0;
+  }
+  if (out_height != nullptr) {
+    *out_height = 0;
+  }
+  if (g_real_sdl_get_wm_info == nullptr) {
+    g_real_sdl_get_wm_info =
+        reinterpret_cast<SdlGetWmInfoFn>(ResolveSdl12Symbol("SDL_GetWMInfo"));
+  }
+  if (g_real_sdl_get_wm_info == nullptr) {
+    return false;
+  }
+
+  Display* display = nullptr;
+  Window window = 0;
+  if (!GetSdlX11Window(&display, &window)) {
+    return false;
+  }
+
+  struct XWindowAttributes {
+    int x;
+    int y;
+    int width;
+    int height;
+    int border_width;
+    int depth;
+    void* visual;
+    Window root;
+    int c_class;
+    int bit_gravity;
+    int win_gravity;
+    int backing_store;
+    unsigned long backing_planes;
+    unsigned long backing_pixel;
+    int save_under;
+    Colormap colormap;
+    int map_installed;
+    int map_state;
+    long all_event_masks;
+    long your_event_mask;
+    long do_not_propagate_mask;
+    int override_redirect;
+    void* screen;
+  };
+  typedef int (*XGetWindowAttributesFn)(Display*, Window, XWindowAttributes*);
+  XGetWindowAttributesFn get_window_attributes =
+      reinterpret_cast<XGetWindowAttributesFn>(ResolveX11Symbol("XGetWindowAttributes"));
+  if (get_window_attributes == nullptr) {
+    return false;
+  }
+
+  XWindowAttributes attrs = {};
+  if (!get_window_attributes(display, window, &attrs) ||
+      attrs.width <= 0 || attrs.height <= 0 ||
+      attrs.width > 10000 || attrs.height > 10000) {
+    return false;
+  }
+  if (out_width != nullptr) {
+    *out_width = attrs.width;
+  }
+  if (out_height != nullptr) {
+    *out_height = attrs.height;
+  }
+  return true;
+}
+
+bool GetSdlPointerPosition(int* out_x, int* out_y) {
+  if (out_x != nullptr) {
+    *out_x = 0;
+  }
+  if (out_y != nullptr) {
+    *out_y = 0;
+  }
+
+  Display* display = nullptr;
+  Window window = 0;
+  if (!GetSdlX11Window(&display, &window)) {
+    return false;
+  }
+
+  typedef int (*XQueryPointerFn)(
+      Display*,
+      Window,
+      Window*,
+      Window*,
+      int*,
+      int*,
+      int*,
+      int*,
+      unsigned int*);
+  XQueryPointerFn query_pointer =
+      reinterpret_cast<XQueryPointerFn>(ResolveX11Symbol("XQueryPointer"));
+  if (query_pointer == nullptr) {
+    return false;
+  }
+
+  Window root = 0;
+  Window child = 0;
+  int root_x = 0;
+  int root_y = 0;
+  int win_x = 0;
+  int win_y = 0;
+  unsigned int mask = 0;
+  if (!query_pointer(display, window, &root, &child, &root_x, &root_y, &win_x, &win_y, &mask)) {
+    return false;
+  }
+  if (win_x < 0 || win_y < 0 || win_x > 10000 || win_y > 10000) {
+    return false;
+  }
+  if (out_x != nullptr) {
+    *out_x = win_x;
+  }
+  if (out_y != nullptr) {
+    *out_y = win_y;
+  }
+  return true;
 }
 
 SdlPushEventFn ResolveSdlPushEvent() {
@@ -2244,18 +2483,89 @@ bool SetActionModeOnMain(int32_t mode, int32_t enabled, int32_t* out_active, int
   return true;
 }
 
+int HexDigitValue(char value) {
+  if (value >= '0' && value <= '9') {
+    return value - '0';
+  }
+  if (value >= 'a' && value <= 'f') {
+    return 10 + (value - 'a');
+  }
+  if (value >= 'A' && value <= 'F') {
+    return 10 + (value - 'A');
+  }
+  return -1;
+}
+
+bool TryParseOverlayLineColor(const char* text, uint32_t* out_color) {
+  if (text == nullptr || text[0] != kOverlayLineColorMarker) {
+    return false;
+  }
+  for (int index = 1; index < kOverlayLineColorMarkerLength; ++index) {
+    if (text[index] == '\0') {
+      return false;
+    }
+  }
+  if (text[7] != ';') {
+    return false;
+  }
+
+  uint32_t color = 0;
+  for (int index = 0; index < 6; ++index) {
+    const int digit = HexDigitValue(text[index + 1]);
+    if (digit < 0) {
+      return false;
+    }
+    color = (color << 4) | static_cast<uint32_t>(digit);
+  }
+
+  if (out_color != nullptr) {
+    *out_color = color & 0xFFFFFFu;
+  }
+  return true;
+}
+
+const char* OverlayVisibleTextAfterControls(const char* text) {
+  const char prefix[] = "controls;";
+  if (text == nullptr || text[0] != kOverlayControlMarker ||
+      strncmp(text + 1, prefix, sizeof(prefix) - 1) != 0) {
+    return text != nullptr ? text : "";
+  }
+
+  const char* line_end = text + 1 + (sizeof(prefix) - 1);
+  while (*line_end != '\0' && *line_end != '\r' && *line_end != '\n') {
+    ++line_end;
+  }
+  if (*line_end == '\r') {
+    ++line_end;
+    if (*line_end == '\n') {
+      ++line_end;
+    }
+  } else if (*line_end == '\n') {
+    ++line_end;
+  }
+  return line_end;
+}
+
 void ParseOverlayControls(OverlayRecord* record, const char** visible_text) {
   record->control_count = 0;
   const char* text = record->text;
-  if (text[0] != kOverlayControlMarker || strncmp(text + 1, "controls;", 9) != 0) {
+  const char prefix[] = "controls;";
+  if (text[0] != kOverlayControlMarker || strncmp(text + 1, prefix, sizeof(prefix) - 1) != 0) {
     *visible_text = text;
     return;
   }
-  const char* cursor = text + 10;
+
+  const char* cursor = text + 1 + (sizeof(prefix) - 1);
+  const char* line_end = cursor;
+  while (*line_end != '\0' && *line_end != '\r' && *line_end != '\n') {
+    ++line_end;
+  }
+
   int count = 0;
-  while (*cursor != '\0' && count < kOverlayMaxControls) {
-    const char* semi = strchr(cursor, ';');
-    const size_t part_len = semi != nullptr ? static_cast<size_t>(semi - cursor) : strlen(cursor);
+  while (cursor < line_end && count < kOverlayMaxControls) {
+    const char* semi = static_cast<const char*>(memchr(cursor, ';', static_cast<size_t>(line_end - cursor)));
+    const char* part_end = semi != nullptr ? semi : line_end;
+    const size_t part_len = static_cast<size_t>(part_end - cursor);
     char part[128] = {};
     snprintf(part, sizeof(part), "%.*s", static_cast<int>(part_len), cursor);
     char* first = strchr(part, '|');
@@ -2274,7 +2584,86 @@ void ParseOverlayControls(OverlayRecord* record, const char** visible_text) {
     cursor = semi + 1;
   }
   record->control_count = count;
-  *visible_text = "";
+  *visible_text = OverlayVisibleTextAfterControls(text);
+}
+
+int OverlayFontScale(int font_size) {
+  if (font_size <= 0) {
+    font_size = 16;
+  }
+  if (font_size > 72) {
+    font_size = 72;
+  }
+  int scale = (font_size + 5) / 8;
+  if (scale < 1) {
+    scale = 1;
+  }
+  if (scale > 8) {
+    scale = 8;
+  }
+  return scale;
+}
+
+int OverlayTextAdvance(int font_size) {
+  return 6 * OverlayFontScale(font_size);
+}
+
+int OverlayGlyphHeight(int font_size) {
+  return 7 * OverlayFontScale(font_size);
+}
+
+int OverlayLineHeight(int font_size) {
+  return OverlayGlyphHeight(font_size) + 4;
+}
+
+int OverlayControlAreaWidth(int control_count) {
+  if (control_count <= 0) {
+    return 0;
+  }
+  return kOverlayControlPadding * 2 +
+      control_count * kOverlayControlButtonSize +
+      (control_count - 1) * kOverlayControlGap;
+}
+
+void MeasureOverlayText(const char* text, int font_size, int* out_width, int* out_height) {
+  int longest = 0;
+  int current = 0;
+  int lines = 1;
+  bool line_start = true;
+  const int advance = OverlayTextAdvance(font_size);
+  const char* cursor = text != nullptr ? text : "";
+  while (*cursor != '\0') {
+    if (line_start && TryParseOverlayLineColor(cursor, nullptr)) {
+      cursor += kOverlayLineColorMarkerLength;
+      continue;
+    }
+    if (*cursor == '\r' || *cursor == '\n') {
+      if (current > longest) {
+        longest = current;
+      }
+      current = 0;
+      ++lines;
+      if (*cursor == '\r' && cursor[1] == '\n') {
+        cursor += 2;
+      } else {
+        ++cursor;
+      }
+      line_start = true;
+      continue;
+    }
+    current += advance;
+    ++cursor;
+    line_start = false;
+  }
+  if (current > longest) {
+    longest = current;
+  }
+  if (out_width != nullptr) {
+    *out_width = kOverlayTextPadding * 2 + longest;
+  }
+  if (out_height != nullptr) {
+    *out_height = kOverlayTextPadding * 2 + lines * OverlayLineHeight(font_size);
+  }
 }
 
 bool StoreOverlayText(const OverlayTextRequestHeader& request, const char* text, int32_t* out_width, int32_t* out_height) {
@@ -2310,33 +2699,35 @@ bool StoreOverlayText(const OverlayTextRequestHeader& request, const char* text,
   snprintf(record.text, sizeof(record.text), "%s", text != nullptr ? text : "");
   const char* visible = record.text;
   ParseOverlayControls(&record, &visible);
-  int longest = 0;
-  int lines = 1;
-  int current = 0;
-  for (const char* p = visible; *p != '\0'; ++p) {
-    if (*p == '\n') {
-      if (current > longest) {
-        longest = current;
-      }
-      current = 0;
-      ++lines;
-    } else {
-      ++current;
+  int text_width = 0;
+  int text_height = 0;
+  const bool has_panel = visible != nullptr && visible[0] != '\0';
+  if (has_panel) {
+    MeasureOverlayText(visible, record.font_size, &text_width, &text_height);
+  }
+  const int control_width = OverlayControlAreaWidth(record.control_count);
+  const int control_height = record.control_count > 0
+      ? kOverlayControlPadding * 2 + kOverlayControlButtonSize
+      : 0;
+  record.width = text_width > control_width ? text_width : control_width;
+  record.height = text_height + control_height;
+  if (record.width < 8) {
+    record.width = 8;
+  }
+  if (record.height < 8) {
+    record.height = 8;
+  }
+  if (record.control_count > 0) {
+    const int min_width = OverlayControlAreaWidth(record.control_count);
+    if (record.width < min_width) {
+      record.width = min_width;
     }
   }
-  if (current > longest) {
-    longest = current;
+  if (record.width > kOverlayMaxDimension) {
+    record.width = kOverlayMaxDimension;
   }
-  if (record.control_count > 0) {
-    longest = record.control_count * 3;
-  }
-  record.width = kOverlayTextPadding * 2 + longest * 8;
-  record.height = kOverlayTextPadding * 2 + lines * 14;
-  if (record.control_count > 0) {
-    record.width = kOverlayControlPadding * 2 +
-        record.control_count * kOverlayControlButtonSize +
-        (record.control_count - 1) * kOverlayControlGap;
-    record.height = kOverlayControlPadding * 2 + kOverlayControlButtonSize;
+  if (record.height > kOverlayMaxDimension) {
+    record.height = kOverlayMaxDimension;
   }
   if (out_width != nullptr) {
     *out_width = record.width;
@@ -2383,7 +2774,16 @@ bool ClearAllOverlays() {
 
 template <typename T>
 bool ResolveGraphicsSymbol(T* out, const char* name) {
-  *out = reinterpret_cast<T>(dlsym(RTLD_DEFAULT, name));
+  void* symbol = dlsym(RTLD_DEFAULT, name);
+  if (symbol == nullptr) {
+    if (g_libgl_handle == nullptr) {
+      g_libgl_handle = dlopen("libGL.so.1", RTLD_LAZY | RTLD_GLOBAL);
+    }
+    if (g_libgl_handle != nullptr) {
+      symbol = dlsym(g_libgl_handle, name);
+    }
+  }
+  *out = reinterpret_cast<T>(symbol);
   return *out != nullptr;
 }
 
@@ -2396,33 +2796,26 @@ bool ResolveGraphicsApi() {
   }
 
   bool ok = true;
-  ok = ResolveGraphicsSymbol(&g_graphics.XOpenDisplay, "XOpenDisplay") && ok;
-  ok = ResolveGraphicsSymbol(&g_graphics.XLoadFont, "XLoadFont") && ok;
-  ok = ResolveGraphicsSymbol(&g_graphics.glGenLists, "glGenLists") && ok;
-  ok = ResolveGraphicsSymbol(&g_graphics.glXUseXFont, "glXUseXFont") && ok;
-  ok = ResolveGraphicsSymbol(&g_graphics.glColor4f, "glColor4f") && ok;
-  ok = ResolveGraphicsSymbol(&g_graphics.glBegin, "glBegin") && ok;
-  ok = ResolveGraphicsSymbol(&g_graphics.glVertex2f, "glVertex2f") && ok;
-  ok = ResolveGraphicsSymbol(&g_graphics.glEnd, "glEnd") && ok;
-  ok = ResolveGraphicsSymbol(&g_graphics.glRasterPos2i, "glRasterPos2i") && ok;
-  ok = ResolveGraphicsSymbol(&g_graphics.glListBase, "glListBase") && ok;
-  ok = ResolveGraphicsSymbol(&g_graphics.glCallLists, "glCallLists") && ok;
   ok = ResolveGraphicsSymbol(&g_graphics.glGetIntegerv, "glGetIntegerv") && ok;
-  ok = ResolveGraphicsSymbol(&g_graphics.glPushAttrib, "glPushAttrib") && ok;
+  ok = ResolveGraphicsSymbol(&g_graphics.glIsEnabled, "glIsEnabled") && ok;
   ok = ResolveGraphicsSymbol(&g_graphics.glDisable, "glDisable") && ok;
   ok = ResolveGraphicsSymbol(&g_graphics.glEnable, "glEnable") && ok;
   ok = ResolveGraphicsSymbol(&g_graphics.glBlendFunc, "glBlendFunc") && ok;
+  ok = ResolveGraphicsSymbol(&g_graphics.glDepthMask, "glDepthMask") && ok;
+  ok = ResolveGraphicsSymbol(&g_graphics.glColor3f, "glColor3f") && ok;
   ok = ResolveGraphicsSymbol(&g_graphics.glMatrixMode, "glMatrixMode") && ok;
   ok = ResolveGraphicsSymbol(&g_graphics.glPushMatrix, "glPushMatrix") && ok;
   ok = ResolveGraphicsSymbol(&g_graphics.glLoadIdentity, "glLoadIdentity") && ok;
-  ok = ResolveGraphicsSymbol(&g_graphics.glOrtho, "glOrtho") && ok;
   ok = ResolveGraphicsSymbol(&g_graphics.glPopMatrix, "glPopMatrix") && ok;
-  ok = ResolveGraphicsSymbol(&g_graphics.glPopAttrib, "glPopAttrib") && ok;
+  ok = ResolveGraphicsSymbol(&g_graphics.glBindTexture, "glBindTexture") && ok;
+  ok = ResolveGraphicsSymbol(&g_graphics.glRasterPos2f, "glRasterPos2f") && ok;
+  ok = ResolveGraphicsSymbol(&g_graphics.glDrawPixels, "glDrawPixels") && ok;
+  ok = ResolveGraphicsSymbol(&g_graphics.glPixelStorei, "glPixelStorei") && ok;
 
   if (!ok) {
     g_graphics_failed = 1;
     AtomicSet(&g_state.overlay_last_error, ENOSYS);
-    LogMessage(kLogError, "could not resolve required OpenGL/X11 symbols for overlay rendering");
+    LogMessage(kLogError, "could not resolve required OpenGL symbols for overlay rendering");
     return false;
   }
 
@@ -2445,48 +2838,321 @@ void TryInitXThreads() {
 }
 
 
-bool EnsureGlFont() {
-  if (g_gl_font_ready) {
-    return true;
+char UpperAscii(char value) {
+  if (value >= 'a' && value <= 'z') {
+    return static_cast<char>(value - ('a' - 'A'));
   }
-  if (!ResolveGraphicsApi()) {
-    return false;
-  }
-  if (g_x_display == nullptr) {
-    g_x_display = g_graphics.XOpenDisplay(nullptr);
-  }
-  if (g_x_display == nullptr) {
-    return false;
-  }
-  g_x_font = g_graphics.XLoadFont(g_x_display, "fixed");
-  if (g_x_font == 0) {
-    return false;
-  }
-  g_gl_font_base = g_graphics.glGenLists(256);
-  if (g_gl_font_base == 0) {
-    return false;
-  }
-  g_graphics.glXUseXFont(g_x_font, 0, 256, static_cast<int>(g_gl_font_base));
-  g_gl_font_ready = 1;
-  return true;
+  return value;
 }
 
-void SetColor(uint32_t rgb, float alpha) {
-  g_graphics.glColor4f(
-      static_cast<float>((rgb >> 16) & 0xFF) / 255.0f,
-      static_cast<float>((rgb >> 8) & 0xFF) / 255.0f,
-      static_cast<float>(rgb & 0xFF) / 255.0f,
-      alpha);
+const uint8_t* OverlayGlyphRows(char value) {
+  static const uint8_t space[7] = {0, 0, 0, 0, 0, 0, 0};
+  static const uint8_t question[7] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04};
+  const char ch = UpperAscii(value);
+  switch (ch) {
+    case 'A': { static const uint8_t rows[7] = {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}; return rows; }
+    case 'B': { static const uint8_t rows[7] = {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}; return rows; }
+    case 'C': { static const uint8_t rows[7] = {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}; return rows; }
+    case 'D': { static const uint8_t rows[7] = {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}; return rows; }
+    case 'E': { static const uint8_t rows[7] = {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}; return rows; }
+    case 'F': { static const uint8_t rows[7] = {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}; return rows; }
+    case 'G': { static const uint8_t rows[7] = {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}; return rows; }
+    case 'H': { static const uint8_t rows[7] = {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}; return rows; }
+    case 'I': { static const uint8_t rows[7] = {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}; return rows; }
+    case 'J': { static const uint8_t rows[7] = {0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0C}; return rows; }
+    case 'K': { static const uint8_t rows[7] = {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}; return rows; }
+    case 'L': { static const uint8_t rows[7] = {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}; return rows; }
+    case 'M': { static const uint8_t rows[7] = {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}; return rows; }
+    case 'N': { static const uint8_t rows[7] = {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11}; return rows; }
+    case 'O': { static const uint8_t rows[7] = {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}; return rows; }
+    case 'P': { static const uint8_t rows[7] = {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}; return rows; }
+    case 'Q': { static const uint8_t rows[7] = {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D}; return rows; }
+    case 'R': { static const uint8_t rows[7] = {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}; return rows; }
+    case 'S': { static const uint8_t rows[7] = {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}; return rows; }
+    case 'T': { static const uint8_t rows[7] = {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}; return rows; }
+    case 'U': { static const uint8_t rows[7] = {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}; return rows; }
+    case 'V': { static const uint8_t rows[7] = {0x11, 0x11, 0x11, 0x11, 0x0A, 0x0A, 0x04}; return rows; }
+    case 'W': { static const uint8_t rows[7] = {0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11}; return rows; }
+    case 'X': { static const uint8_t rows[7] = {0x11, 0x0A, 0x04, 0x04, 0x04, 0x0A, 0x11}; return rows; }
+    case 'Y': { static const uint8_t rows[7] = {0x11, 0x0A, 0x04, 0x04, 0x04, 0x04, 0x04}; return rows; }
+    case 'Z': { static const uint8_t rows[7] = {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}; return rows; }
+    case '0': { static const uint8_t rows[7] = {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}; return rows; }
+    case '1': { static const uint8_t rows[7] = {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}; return rows; }
+    case '2': { static const uint8_t rows[7] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}; return rows; }
+    case '3': { static const uint8_t rows[7] = {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E}; return rows; }
+    case '4': { static const uint8_t rows[7] = {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}; return rows; }
+    case '5': { static const uint8_t rows[7] = {0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E}; return rows; }
+    case '6': { static const uint8_t rows[7] = {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}; return rows; }
+    case '7': { static const uint8_t rows[7] = {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}; return rows; }
+    case '8': { static const uint8_t rows[7] = {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}; return rows; }
+    case '9': { static const uint8_t rows[7] = {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}; return rows; }
+    case ':': { static const uint8_t rows[7] = {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00}; return rows; }
+    case '.': { static const uint8_t rows[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C}; return rows; }
+    case ',': { static const uint8_t rows[7] = {0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x08}; return rows; }
+    case '-': { static const uint8_t rows[7] = {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}; return rows; }
+    case '+': { static const uint8_t rows[7] = {0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00}; return rows; }
+    case '/': { static const uint8_t rows[7] = {0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10}; return rows; }
+    case '\\': { static const uint8_t rows[7] = {0x10, 0x08, 0x08, 0x04, 0x02, 0x02, 0x01}; return rows; }
+    case '[': { static const uint8_t rows[7] = {0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E}; return rows; }
+    case ']': { static const uint8_t rows[7] = {0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E}; return rows; }
+    case '(': { static const uint8_t rows[7] = {0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02}; return rows; }
+    case ')': { static const uint8_t rows[7] = {0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08}; return rows; }
+    case '!': { static const uint8_t rows[7] = {0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04}; return rows; }
+    case '\'': { static const uint8_t rows[7] = {0x04, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00}; return rows; }
+    case '"': { static const uint8_t rows[7] = {0x0A, 0x0A, 0x0A, 0x00, 0x00, 0x00, 0x00}; return rows; }
+    case '#': { static const uint8_t rows[7] = {0x0A, 0x1F, 0x0A, 0x0A, 0x1F, 0x0A, 0x00}; return rows; }
+    case '%': { static const uint8_t rows[7] = {0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x03}; return rows; }
+    case '&': { static const uint8_t rows[7] = {0x0C, 0x12, 0x14, 0x08, 0x15, 0x12, 0x0D}; return rows; }
+    case '*': { static const uint8_t rows[7] = {0x00, 0x15, 0x0E, 0x1F, 0x0E, 0x15, 0x00}; return rows; }
+    case '=': { static const uint8_t rows[7] = {0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00}; return rows; }
+    case '<': { static const uint8_t rows[7] = {0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02}; return rows; }
+    case '>': { static const uint8_t rows[7] = {0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08}; return rows; }
+    case ' ': return space;
+    default: return question;
+  }
 }
 
-void DrawFilledRect(float x, float y, float w, float h, uint32_t rgb, float alpha) {
-  SetColor(rgb, alpha);
-  g_graphics.glBegin(GL_QUADS);
-  g_graphics.glVertex2f(x, y);
-  g_graphics.glVertex2f(x + w, y);
-  g_graphics.glVertex2f(x + w, y + h);
-  g_graphics.glVertex2f(x, y + h);
-  g_graphics.glEnd();
+void PutOverlayPixel(uint8_t* pixels, int width, int height, int x, int y, uint32_t rgb, uint8_t alpha) {
+  if (pixels == nullptr || x < 0 || y < 0 || x >= width || y >= height) {
+    return;
+  }
+  const int row = height - 1 - y;
+  const int offset = (row * width + x) * 4;
+  pixels[offset + 0] = static_cast<uint8_t>((rgb >> 16) & 0xFF);
+  pixels[offset + 1] = static_cast<uint8_t>((rgb >> 8) & 0xFF);
+  pixels[offset + 2] = static_cast<uint8_t>(rgb & 0xFF);
+  pixels[offset + 3] = alpha;
+}
+
+void FillOverlayRect(uint8_t* pixels, int width, int height, int x, int y, int w, int h, uint32_t rgb, uint8_t alpha) {
+  for (int yy = y; yy < y + h; ++yy) {
+    for (int xx = x; xx < x + w; ++xx) {
+      PutOverlayPixel(pixels, width, height, xx, yy, rgb, alpha);
+    }
+  }
+}
+
+void DrawOverlayRectOutline(uint8_t* pixels, int width, int height, int x, int y, int w, int h, uint32_t rgb, uint8_t alpha) {
+  FillOverlayRect(pixels, width, height, x, y, w, 1, rgb, alpha);
+  FillOverlayRect(pixels, width, height, x, y + h - 1, w, 1, rgb, alpha);
+  FillOverlayRect(pixels, width, height, x, y, 1, h, rgb, alpha);
+  FillOverlayRect(pixels, width, height, x + w - 1, y, 1, h, rgb, alpha);
+}
+
+void DrawOverlayGlyph(uint8_t* pixels, int width, int height, int x, int y, char ch, int scale, uint32_t rgb) {
+  if (scale < 1) {
+    scale = 1;
+  }
+  const uint8_t* rows = OverlayGlyphRows(ch);
+  for (int row = 0; row < 7; ++row) {
+    for (int col = 0; col < 5; ++col) {
+      if ((rows[row] & (1u << (4 - col))) == 0) {
+        continue;
+      }
+      FillOverlayRect(pixels, width, height, x + col * scale, y + row * scale, scale, scale, rgb, 255);
+    }
+  }
+}
+
+void DrawOverlayString(uint8_t* pixels, int width, int height, int x, int y, const char* text, int length, int scale, uint32_t rgb) {
+  if (text == nullptr || length <= 0) {
+    return;
+  }
+  int draw_x = x;
+  const int advance = 6 * (scale > 0 ? scale : 1);
+  for (int index = 0; index < length && text[index] != '\0'; ++index) {
+    DrawOverlayGlyph(pixels, width, height, draw_x, y, text[index], scale, rgb);
+    draw_x += advance;
+  }
+}
+
+void DrawOverlayCircle(uint8_t* pixels, int width, int height, int left, int top, int size, uint32_t fill_rgb, uint32_t border_rgb) {
+  const int radius = size / 2;
+  const int center_x = left + radius;
+  const int center_y = top + radius;
+  const int radius_sq = radius * radius;
+  const int inner = radius - 2;
+  const int inner_sq = inner * inner;
+  for (int yy = top; yy < top + size; ++yy) {
+    for (int xx = left; xx < left + size; ++xx) {
+      const int dx = xx - center_x;
+      const int dy = yy - center_y;
+      const int dist_sq = dx * dx + dy * dy;
+      if (dist_sq <= radius_sq) {
+        PutOverlayPixel(pixels, width, height, xx, yy, dist_sq >= inner_sq ? border_rgb : fill_rgb, 255);
+      }
+    }
+  }
+}
+
+void UpdateOverlayScreenPosition(OverlayRecord& record, int viewport_w, int viewport_h) {
+  int x = 0;
+  int y = 0;
+  switch (record.position) {
+    case 1:
+      x = 20;
+      y = 50;
+      break;
+    case 2:
+      x = (viewport_w - record.width) / 2;
+      y = 50;
+      break;
+    case 3:
+      x = viewport_w - record.width - 90;
+      y = 50;
+      break;
+    case 4:
+      x = 20;
+      y = (viewport_h - record.height) / 2;
+      break;
+    case 5:
+      x = (viewport_w - record.width) / 2;
+      y = (viewport_h - record.height) / 2;
+      break;
+    case 6:
+      x = viewport_w - record.width - 90;
+      y = (viewport_h - record.height) / 2;
+      break;
+    case 7:
+      x = 20;
+      y = viewport_h - record.height - 70;
+      break;
+    case 8:
+      x = (viewport_w - record.width) / 2;
+      y = viewport_h - record.height - 70;
+      break;
+    case 9:
+      x = viewport_w - record.width - 90;
+      y = viewport_h - record.height - 70;
+      break;
+    case 0:
+    default:
+      x = 0;
+      y = 0;
+      break;
+  }
+  record.screen_x = x + record.offset_x;
+  record.screen_y = y + record.offset_y;
+}
+
+uint8_t* BuildOverlayPixels(
+    OverlayRecord& record,
+    int window_origin_x,
+    int window_origin_y,
+    uint32_t* out_pixel_bytes) {
+  if (out_pixel_bytes != nullptr) {
+    *out_pixel_bytes = 0;
+  }
+  if (record.width <= 0 || record.height <= 0 ||
+      record.width > kOverlayMaxDimension || record.height > kOverlayMaxDimension) {
+    return nullptr;
+  }
+
+  const uint64_t pixel_bytes64 =
+      static_cast<uint64_t>(record.width) * static_cast<uint64_t>(record.height) * 4u;
+  if (pixel_bytes64 == 0 || pixel_bytes64 > 0x7FFFFFFFu) {
+    return nullptr;
+  }
+
+  uint8_t* pixels = static_cast<uint8_t*>(malloc(static_cast<size_t>(pixel_bytes64)));
+  if (pixels == nullptr) {
+    return nullptr;
+  }
+  memset(pixels, 0, static_cast<size_t>(pixel_bytes64));
+  FillOverlayRect(pixels, record.width, record.height, 0, 0, record.width, record.height, 0x0C1012, 170);
+
+  const int controls_width = OverlayControlAreaWidth(record.control_count);
+  const int controls_height = record.control_count > 0
+      ? kOverlayControlPadding * 2 + kOverlayControlButtonSize
+      : 0;
+  if (record.control_count > 0) {
+    int button_x = record.width - controls_width + kOverlayControlPadding;
+    if (button_x < kOverlayControlPadding) {
+      button_x = kOverlayControlPadding;
+    }
+    const int button_y = kOverlayControlPadding;
+    for (int index = 0; index < record.control_count; ++index) {
+      OverlayControlButton& button = record.controls[index];
+      button.x1 = window_origin_x + record.screen_x + button_x;
+      button.y1 = window_origin_y + record.screen_y + button_y;
+      button.x2 = button.x1 + kOverlayControlButtonSize;
+      button.y2 = button.y1 + kOverlayControlButtonSize;
+      DrawOverlayCircle(
+          pixels,
+          record.width,
+          record.height,
+          button_x,
+          button_y,
+          kOverlayControlButtonSize,
+          button.enabled ? 0x105226 : 0x302424,
+          button.enabled ? 0x60E678 : 0xD25A5A);
+      const int label_len = static_cast<int>(strnlen(button.label, sizeof(button.label)));
+      const int label_width = label_len * 6;
+      const int label_x = button_x + (kOverlayControlButtonSize - label_width) / 2;
+      const int label_y = button_y + (kOverlayControlButtonSize - 7) / 2;
+      DrawOverlayString(
+          pixels,
+          record.width,
+          record.height,
+          label_x,
+          label_y,
+          button.label,
+          label_len,
+          1,
+          button.enabled ? 0xF5FFF5 : 0xDCBEBE);
+      button_x += kOverlayControlButtonSize + kOverlayControlGap;
+    }
+  }
+
+  const char* visible = OverlayVisibleTextAfterControls(record.text);
+  if (visible != nullptr && visible[0] != '\0') {
+    const int text_scale = OverlayFontScale(record.font_size);
+    const int line_height = OverlayLineHeight(record.font_size);
+    const int header_height = line_height + kOverlayTextPadding * 2;
+    const int panel_y = controls_height;
+    FillOverlayRect(pixels, record.width, record.height, 0, panel_y, record.width, header_height, 0x182024, 200);
+    DrawOverlayRectOutline(pixels, record.width, record.height, 0, panel_y, record.width, record.height - panel_y, 0x5A6E78, 220);
+    FillOverlayRect(pixels, record.width, record.height, 0, panel_y + header_height, record.width, 1, 0x5A6E78, 220);
+
+    int line_y = panel_y + kOverlayTextPadding;
+    uint32_t color = record.color_rgb != 0 ? record.color_rgb : 0xFFFFFFu;
+    const char* cursor = visible;
+    while (*cursor != '\0' && line_y < record.height - kOverlayTextPadding) {
+      if (TryParseOverlayLineColor(cursor, &color)) {
+        cursor += kOverlayLineColorMarkerLength;
+      }
+      const char* line_end = cursor;
+      while (*line_end != '\0' && *line_end != '\r' && *line_end != '\n') {
+        ++line_end;
+      }
+      const int line_len = static_cast<int>(line_end - cursor);
+      DrawOverlayString(
+          pixels,
+          record.width,
+          record.height,
+          kOverlayTextPadding,
+          line_y,
+          cursor,
+          line_len,
+          text_scale,
+          color);
+      line_y += line_height;
+      cursor = line_end;
+      if (*cursor == '\r') {
+        ++cursor;
+        if (*cursor == '\n') {
+          ++cursor;
+        }
+      } else if (*cursor == '\n') {
+        ++cursor;
+      }
+    }
+  }
+
+  if (out_pixel_bytes != nullptr) {
+    *out_pixel_bytes = static_cast<uint32_t>(pixel_bytes64);
+  }
+  return pixels;
 }
 
 void DisableOverlayRenderingAfterFault(int signal_number, const char* phase) {
@@ -2530,93 +3196,58 @@ void UpdateRenderedOverlayBounds(const OverlayRecord& rendered, int index) {
   pthread_mutex_unlock(&g_state.overlay_mutex);
 }
 
-void RestoreOverlayGlState() {
+void RestoreOverlayGlState(
+    GLint matrix_mode,
+    GLint texture,
+    GLint depth_mask,
+    GLboolean blend_enabled,
+    GLboolean depth_enabled,
+    GLboolean cull_enabled) {
+  g_graphics.glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture));
   g_graphics.glPopMatrix();
   g_graphics.glMatrixMode(GL_PROJECTION);
   g_graphics.glPopMatrix();
-  g_graphics.glMatrixMode(GL_MODELVIEW);
-  g_graphics.glPopAttrib();
+  g_graphics.glMatrixMode(static_cast<GLenum>(matrix_mode));
+  g_graphics.glDepthMask(depth_mask ? 1 : 0);
+  if (blend_enabled) {
+    g_graphics.glEnable(GL_BLEND);
+  } else {
+    g_graphics.glDisable(GL_BLEND);
+  }
+  if (depth_enabled) {
+    g_graphics.glEnable(GL_DEPTH_TEST);
+  } else {
+    g_graphics.glDisable(GL_DEPTH_TEST);
+  }
+  if (cull_enabled) {
+    g_graphics.glEnable(GL_CULL_FACE);
+  } else {
+    g_graphics.glDisable(GL_CULL_FACE);
+  }
 }
 
-void RenderOverlayText(OverlayRecord& record, int viewport_w, int viewport_h) {
-  if (!EnsureGlFont()) {
-    return;
-  }
-  int x = record.offset_x;
-  int y = record.offset_y;
-  if (record.position != 0) {
-    const int col = (record.position - 1) % 3;
-    const int row = (record.position - 1) / 3;
-    if (col == 1) {
-      x += (viewport_w - record.width) / 2;
-    } else if (col == 2) {
-      x += viewport_w - record.width;
-    }
-    if (row == 1) {
-      y += (viewport_h - record.height) / 2;
-    } else if (row == 2) {
-      y += viewport_h - record.height;
-    }
+bool RenderOverlayText(
+    OverlayRecord& record,
+    int viewport_w,
+    int viewport_h,
+    int window_origin_x,
+    int window_origin_y) {
+  UpdateOverlayScreenPosition(record, viewport_w, viewport_h);
+  uint32_t pixel_bytes = 0;
+  uint8_t* pixels = BuildOverlayPixels(record, window_origin_x, window_origin_y, &pixel_bytes);
+  if (pixels == nullptr || pixel_bytes == 0) {
+    free(pixels);
+    return false;
   }
 
-  record.screen_x = x;
-  record.screen_y = y;
-  DrawFilledRect(x, y, record.width, record.height, 0x000000, 0.62f);
-
-  if (record.control_count > 0) {
-    int bx = x + kOverlayControlPadding;
-    const int by = y + kOverlayControlPadding;
-    for (int i = 0; i < record.control_count; ++i) {
-      OverlayControlButton& button = record.controls[i];
-      button.x1 = bx;
-      button.y1 = by;
-      button.x2 = bx + kOverlayControlButtonSize;
-      button.y2 = by + kOverlayControlButtonSize;
-      DrawFilledRect(
-          bx,
-          by,
-          kOverlayControlButtonSize,
-          kOverlayControlButtonSize,
-          button.enabled ? 0x2E7D32 : 0x555555,
-          0.9f);
-      SetColor(0xFFFFFF, 1.0f);
-      g_graphics.glRasterPos2i(bx + 4, by + 15);
-      g_graphics.glListBase(g_gl_font_base);
-      g_graphics.glCallLists(static_cast<GLsizei>(strnlen(button.label, sizeof(button.label))), GL_UNSIGNED_BYTE, button.label);
-      bx += kOverlayControlButtonSize + kOverlayControlGap;
-    }
-    return;
-  }
-
-  const char* text = record.text;
-  int line_y = y + kOverlayTextPadding + 12;
-  uint32_t color = record.color_rgb ? record.color_rgb : 0xFFFFFF;
-  char line[512] = {};
-  const char* cursor = text;
-  while (*cursor != '\0') {
-    size_t len = 0;
-    while (cursor[len] != '\0' && cursor[len] != '\n' && len < sizeof(line) - 1) {
-      ++len;
-    }
-    memcpy(line, cursor, len);
-    line[len] = '\0';
-    const char* visible = line;
-    if (line[0] == kOverlayLineColorMarker && strlen(line) >= 8 && line[7] == ';') {
-      char tmp[7] = {};
-      memcpy(tmp, line + 1, 6);
-      color = static_cast<uint32_t>(strtoul(tmp, nullptr, 16));
-      visible = line + 8;
-    }
-    SetColor(color, 1.0f);
-    g_graphics.glRasterPos2i(x + kOverlayTextPadding, line_y);
-    g_graphics.glListBase(g_gl_font_base);
-    g_graphics.glCallLists(static_cast<GLsizei>(strlen(visible)), GL_UNSIGNED_BYTE, visible);
-    line_y += 14;
-    cursor += len;
-    if (*cursor == '\n') {
-      ++cursor;
-    }
-  }
+  const float raster_x =
+      (static_cast<float>(record.screen_x) * 2.0f / static_cast<float>(viewport_w)) - 1.0f;
+  const float raster_y =
+      1.0f - (static_cast<float>(record.screen_y + record.height) * 2.0f / static_cast<float>(viewport_h));
+  g_graphics.glRasterPos2f(raster_x, raster_y);
+  g_graphics.glDrawPixels(record.width, record.height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+  free(pixels);
+  return true;
 }
 
 void RenderOverlays() {
@@ -2658,18 +3289,59 @@ void RenderOverlays() {
     return;
   }
 
+  int surface_h = viewport_h;
+  if (!RunWithFaultGuard(
+          [&]() {
+            int queried_h = 0;
+            if (GetSdlWindowSize(nullptr, &queried_h) ||
+                GetSdlVideoSurfaceSize(nullptr, &queried_h)) {
+              surface_h = queried_h;
+            }
+          },
+          &signal_number)) {
+    DisableOverlayRenderingAfterFault(signal_number, "SDL surface query");
+    return;
+  }
+  const int window_origin_x = viewport[0] > 0 ? viewport[0] : 0;
+  int window_origin_y = surface_h - viewport_h - (viewport[1] > 0 ? viewport[1] : 0);
+  if (window_origin_y < 0) {
+    window_origin_y = 0;
+  }
+
+  GLint texture = 0;
+  GLint matrix_mode = GL_MODELVIEW;
+  GLint depth_mask = 1;
+  GLboolean blend_enabled = 0;
+  GLboolean depth_enabled = 0;
+  GLboolean cull_enabled = 0;
+  if (!RunWithFaultGuard(
+          [&]() {
+            g_graphics.glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+            g_graphics.glGetIntegerv(GL_MATRIX_MODE, &matrix_mode);
+            g_graphics.glGetIntegerv(GL_DEPTH_WRITEMASK, &depth_mask);
+            blend_enabled = g_graphics.glIsEnabled(GL_BLEND);
+            depth_enabled = g_graphics.glIsEnabled(GL_DEPTH_TEST);
+            cull_enabled = g_graphics.glIsEnabled(GL_CULL_FACE);
+          },
+          &signal_number)) {
+    DisableOverlayRenderingAfterFault(signal_number, "state query");
+    return;
+  }
+
   bool setup_complete = false;
   if (!RunWithFaultGuard(
           [&]() {
-            g_graphics.glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_TRANSFORM_BIT | GL_CURRENT_BIT);
+            g_graphics.glDisable(GL_CULL_FACE);
             g_graphics.glDisable(GL_DEPTH_TEST);
-            g_graphics.glDisable(GL_TEXTURE_2D);
             g_graphics.glEnable(GL_BLEND);
             g_graphics.glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            g_graphics.glDepthMask(0);
+            g_graphics.glColor3f(1.0f, 1.0f, 1.0f);
+            g_graphics.glBindTexture(GL_TEXTURE_2D, 0);
+            g_graphics.glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
             g_graphics.glMatrixMode(GL_PROJECTION);
             g_graphics.glPushMatrix();
             g_graphics.glLoadIdentity();
-            g_graphics.glOrtho(0.0, viewport_w, viewport_h, 0.0, -1.0, 1.0);
             g_graphics.glMatrixMode(GL_MODELVIEW);
             g_graphics.glPushMatrix();
             g_graphics.glLoadIdentity();
@@ -2682,7 +3354,14 @@ void RenderOverlays() {
 
   bool render_ok = true;
   for (int i = 0; i < record_count; ++i) {
-    if (!RunWithFaultGuard([&]() { RenderOverlayText(records[i], viewport_w, viewport_h); }, &signal_number)) {
+    bool overlay_drawn = false;
+    if (!RunWithFaultGuard(
+            [&]() {
+              overlay_drawn =
+                  RenderOverlayText(records[i], viewport_w, viewport_h, window_origin_x, window_origin_y);
+            },
+            &signal_number) ||
+        !overlay_drawn) {
       render_ok = false;
       break;
     }
@@ -2690,7 +3369,17 @@ void RenderOverlays() {
 
   bool cleanup_ok = true;
   if (setup_complete &&
-      !RunWithFaultGuard([&]() { RestoreOverlayGlState(); }, &signal_number)) {
+      !RunWithFaultGuard(
+          [&]() {
+            RestoreOverlayGlState(
+                matrix_mode,
+                texture,
+                depth_mask,
+                blend_enabled,
+                depth_enabled,
+                cull_enabled);
+          },
+          &signal_number)) {
     cleanup_ok = false;
   }
 
@@ -2731,6 +3420,27 @@ bool HandleOverlayMouseButton(int x, int y) {
   }
   pthread_mutex_unlock(&g_state.overlay_mutex);
   return false;
+}
+
+void HandleSdlOverlayMouseEvent(void* event) {
+  if (event == nullptr) {
+    return;
+  }
+  const uint8_t* bytes = static_cast<const uint8_t*>(event);
+  const uint8_t type = bytes[0];
+  const uint8_t button_state = bytes[3];
+  if (type != 5 || button_state != 1) {
+    return;
+  }
+
+  uint16_t event_x = 0;
+  uint16_t event_y = 0;
+  memcpy(&event_x, bytes + 4, sizeof(event_x));
+  memcpy(&event_y, bytes + 6, sizeof(event_y));
+  int x = event_x;
+  int y = event_y;
+  GetSdlPointerPosition(&x, &y);
+  HandleOverlayMouseButton(x, y);
 }
 
 void FillSnapshotText(const char* reason, char* out, size_t capacity) {
@@ -3447,17 +4157,8 @@ extern "C" int SDL_PollEvent(void* event) {
     }
     break;
   }
-  if (rc && event != nullptr) {
-    const uint8_t* bytes = static_cast<const uint8_t*>(event);
-    const uint8_t type = bytes[0];
-    const uint8_t button_state = bytes[3];
-    if (type == 5 && button_state == 1) {
-      uint16_t x = 0;
-      uint16_t y = 0;
-      memcpy(&x, bytes + 4, sizeof(x));
-      memcpy(&y, bytes + 6, sizeof(y));
-      HandleOverlayMouseButton(x, y);
-    }
+  if (rc) {
+    HandleSdlOverlayMouseEvent(event);
   }
   return rc;
 }
@@ -3475,6 +4176,9 @@ extern "C" int SDL_WaitEvent(void* event) {
     break;
   }
   DrainPendingOnMainThread();
+  if (rc) {
+    HandleSdlOverlayMouseEvent(event);
+  }
   return rc;
 }
 
