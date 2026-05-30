@@ -32,6 +32,7 @@ src/native/SimKeysHook2/Release/
 src/native/SimKeysHook2/x64/
 src/native/SimKeysHook2/logs/
 src/native/SimKeysHookLinux/libSimKeysHookLinux.so
+bin/libSimKeysHookLinux.so
 data/character_defaults.user.json
 
 # Reverse-engineering notes and reference dumps stay local only.
@@ -41,3 +42,9 @@ docs/reverse-engineering/
 Hgx.Client/
 Hgx.Core/
 NWN Diamond/
+
+# uv
+.python-version
+build/
+src/hg_control_console.egg-info/
+uv.lock

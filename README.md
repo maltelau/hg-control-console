@@ -51,6 +51,13 @@ Then run the Python GUI on the same Linux session and it will discover `nwmain` 
 
 The Linux hook provides the same HGCC command operations as the Windows hook: quickbar slots, chat send, overlay requests, player identity, position, movement, walk bypass, and action-mode toggles. Linux in-client OpenGL overlay drawing is opt-in with `SIMKEYS_LINUX_ENABLE_OVERLAY=1`; overlay requests still succeed by default so the GUI can run safely on X11/GL stacks that terminate the client during overlay setup. Passive Linux quickbar/chat tracing is also opt-in (`SIMKEYS_LINUX_ENABLE_QUICKBAR_TRACE=1` and `SIMKEYS_LINUX_ENABLE_CHAT_TRACE=1`) because the command path can discover quickbar state on demand without detouring load-time client code. Already-running Linux clients are not injected; launch them with `simkeys_linux_client.sh`.
 
+### Launching gui
+
+The python gui can be installed as `hgcc` in your PATH using uv:
+``` bash
+uv tool install -e .
+```
+
 ## Requirements
 
 - Windows with Neverwinter Nights Diamond using the 32-bit `nwmain.exe` client, or Linux with the 32-bit NWN 1.69 `nwmain` client.
