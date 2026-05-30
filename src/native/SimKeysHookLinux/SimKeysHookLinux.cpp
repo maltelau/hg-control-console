@@ -109,7 +109,6 @@ constexpr uint32_t kQuickbarSlotPrimaryItemOffset = 0x6Cu;
 constexpr uint32_t kQuickbarSlotSecondaryItemOffset = 0x70u;
 constexpr uint32_t kQuickbarSlotTypeOffset = 0xA0u;
 constexpr uint32_t kCurrentPlayerObjectIdOffset = 0x24u;
-constexpr uint32_t kAppInnerPlayerNameOffset = 0x160u;
 constexpr uint8_t kQuickbarItemSlotType = 1u;
 constexpr int kQuickbarPageCount = 3;
 constexpr int kQuickbarSlotCount = 12;
@@ -1096,22 +1095,6 @@ uint32_t ReadCurrentGuiPointer() {
   return app_inner != 0 ? SafeReadPointer32(static_cast<uintptr_t>(app_inner) + 0x48u) : 0;
 }
 
-bool ReadAppInnerPlayerName(char* out, size_t capacity) {
-  if (out == nullptr || capacity == 0) {
-    return false;
-  }
-  out[0] = '\0';
-  const uint32_t app_inner = ReadAppInnerPointer();
-  if (app_inner == 0) {
-    return false;
-  }
-  return SafeReadString(
-      reinterpret_cast<const void*>(static_cast<uintptr_t>(app_inner) + kAppInnerPlayerNameOffset),
-      out,
-      capacity) &&
-      out[0] != '\0';
-}
-
 bool IsQuickbarPanel(uint32_t panel) {
   return panel != 0 &&
       SafeReadPointer32(static_cast<uintptr_t>(panel) + kQuickbarPanelVtableOffset) == kQuickbarPanelVtable;
@@ -1867,10 +1850,6 @@ bool RefreshCharacterIdentity(int32_t* out_error) {
 
   if (client_player != 0) {
     BuildCurrentPlayerName(client_player, name, sizeof(name));
-  }
-
-  if (name[0] == '\0') {
-    ReadAppInnerPlayerName(name, sizeof(name));
   }
 
   if (name[0] == '\0' && game_object != 0) {
