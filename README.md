@@ -264,7 +264,7 @@ Supported modes:
 - Improved Power Attack: `!action ipm self`
 - Defensive Casting: client `Input_ToggleMode(10)`
 
-Rapid Shot uses an NWN memory byte to determine whether RSM is already active. Defensive Casting is triggered through the client input path because there is no HG chat action for it, and it reads the client creature Defensive Casting state flag at offset `+0x184` to determine whether the mode is actually active. Defensive Casting also runs as an upkeep check, retrying every cooldown when it reads as off, so casters can keep it active without making attacks themselves. The other modes read attack-mode prefixes from outgoing combat-log attack lines. The script uses a retry cooldown and can echo trigger feedback to the in-game console.
+Rapid Shot uses an NWN memory byte to determine whether RSM is already active. Defensive Casting is triggered through the client input path because there is no HG chat action for it, and it reads the client Defensive Casting state flag to determine whether the mode is actually active (`+0x184` on Windows, `+0x188` on Linux). Defensive Casting also runs as an upkeep check, retrying every cooldown when it reads as off, so casters can keep it active without making attacks themselves. The other modes read attack-mode prefixes from outgoing combat-log attack lines. The script uses a retry cooldown and can echo trigger feedback to the in-game console.
 
 ### In-Game Timers
 

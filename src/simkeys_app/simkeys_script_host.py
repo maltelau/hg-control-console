@@ -42,7 +42,7 @@ kLegacyClientDefensiveCastingModeOffset = 0x184
 kLegacyHpOwnerOffset = 0x2B8
 kLegacyCurrentHpOffset = 0x4C
 kLegacyMaxHpProbeOffsets = (2, 4, 6, 8, 0xA, 0xC, 0xE, 0x10)
-kLinuxCreatureDefensiveCastingModeOffset = 0x4AE
+kLinuxClientDefensiveCastingModeOffset = 0x188
 
 WEAPON_SLOT_NONE = "-"
 WEAPON_CURRENT_UNKNOWN = "Unknown"
@@ -7280,8 +7280,8 @@ class AutoCombatModeScript(ClientScriptBase):
             if status not in (0, 1):
                 error_text = (
                     f"unexpected Defensive Casting status {status} at 0x{self.defensive_casting_address:08X} "
-                    f"player=0x{self.defensive_casting_player_object:08X} "
-                    f"clientCreature=0x{self.defensive_casting_creature:08X}"
+                    f"clientPlayer=0x{self.defensive_casting_player_object:08X} "
+                    f"serverCreature=0x{self.defensive_casting_creature:08X}"
                 )
                 self.defensive_casting_address = 0
                 self.defensive_casting_player_object = 0
@@ -7414,17 +7414,17 @@ class AutoCombatModeScript(ClientScriptBase):
                 state = {}
             player_object = int(state.get("player_object", 0) or 0)
             creature = int(state.get("player_creature", 0) or 0)
-            if creature == 0:
-                raise RuntimeError("Defensive Casting creature pointer is not available from the Linux hook yet")
+            if player_object == 0:
+                raise RuntimeError("Defensive Casting client player pointer is not available from the Linux hook yet")
             module_base = int(state.get("module_base", 0) or (self.client.query or {}).get("module_base", 0) or 0)
             self.defensive_casting_player_object = player_object
             self.defensive_casting_creature = creature
-            self.defensive_casting_address = creature + kLinuxCreatureDefensiveCastingModeOffset
+            self.defensive_casting_address = player_object + kLinuxClientDefensiveCastingModeOffset
             self.host.emit(
                 "info",
                 (
                     f"{self.client.display_name}: Defensive Casting path resolved module=0x{module_base:08X} "
-                    f"source=linux-identity clientPlayer=0x{player_object:08X} creature=0x{creature:08X} "
+                    f"source=linux-client-state clientPlayer=0x{player_object:08X} serverCreature=0x{creature:08X} "
                     f"state=0x{self.defensive_casting_address:08X}"
                 ),
                 script_id=self.script_id,
@@ -7458,8 +7458,6 @@ class AutoCombatModeScript(ClientScriptBase):
         return self.defensive_casting_address
 
     def _read_defensive_casting_status(self) -> int:
-        if not IS_WINDOWS:
-            return self._read_u8(self._resolve_defensive_casting_address())
         return self._read_u32(self._resolve_defensive_casting_address())
 
     def _resolve_legacy_player_pointer(self, label: str) -> Tuple[int, int, int]:

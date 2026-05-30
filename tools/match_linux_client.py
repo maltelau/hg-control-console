@@ -234,6 +234,23 @@ def xrefs_to(image: BinaryImage, va: int, section_names: Iterable[str] = (".text
     return refs
 
 
+def relative_call_xrefs_to(image: BinaryImage, va: int, section_names: Iterable[str] = (".text",)) -> list[int]:
+    names = set(section_names)
+    refs: list[int] = []
+    for section in image.sections:
+        if section.name not in names or section.raw_size <= 5:
+            continue
+        blob = image.data[section.offset : section.offset + section.raw_size]
+        for index in range(0, len(blob) - 4):
+            if blob[index] != 0xE8:
+                continue
+            disp = struct.unpack_from("<i", blob, index + 1)[0]
+            ref_va = section.va + index
+            if ref_va + 5 + disp == va:
+                refs.append(ref_va)
+    return refs
+
+
 def find_function_by_pattern(image: BinaryImage, pattern: bytes) -> tuple[Optional[int], Optional[int]]:
     hits = image.find_bytes(pattern, (".text",))
     if not hits:
@@ -579,6 +596,53 @@ def analyze_linux(image: BinaryImage) -> dict[str, object]:
             [
                 f"client object resolver wrapper at {hex32(object_by_id)}",
                 f"server object resolver wrapper at {hex32(server_object_by_id)}",
+            ],
+        )
+    )
+
+    toggle_message = 0x081C4F44 if (
+        has_bytes(image, 0x081C4F44, 0x20, b"\x55\x89\xE5\x56\x53\x83\xEC\x10") and
+        has_bytes(image, 0x081C4F44, 0x90, b"\x80\xFB\x05\x75") and
+        has_bytes(image, 0x081C4F44, 0x90, b"\x6A\x0A\x6A\x06")
+    ) else None
+    toggle_message_refs = relative_call_xrefs_to(image, toggle_message) if toggle_message is not None else []
+    toggle_input = 0x081365CC if (
+        toggle_message is not None and
+        has_bytes(image, 0x081365CC, 0x20, b"\x55\x89\xE5\x57\x56\x53\x83\xEC\x1C") and
+        has_bytes(image, 0x081365CC, 0x30, b"\x8B\x7D\x0C\x85\xFF") and
+        0x08136673 in toggle_message_refs
+    ) else None
+    targets.append(
+        TargetReport(
+            "action_mode.toggle_input",
+            status_from([toggle_input is not None]),
+            toggle_input,
+            "kExpectedToggleModeInput=0x004D00B0",
+            [
+                f"toggle-message writer at {hex32(toggle_message)} writes major=6 minor=10",
+                f"relative call refs to writer: {', '.join(hex32(x) for x in toggle_message_refs) or 'none'}",
+                "wrapper reads mode from stack arg +0x0C and calls the writer at 0x08136673",
+            ],
+        )
+    )
+
+    defensive_state_branch = 0x08157DD0 if (
+        has_bytes(image, 0x08157DD0, 0x20, b"\xF7\x45\x10\x00\x00\x02\x00") and
+        has_bytes(image, 0x08157DD0, 0x400, b"\xF7\xC7\x00\x04\x00\x00") and
+        has_bytes(image, 0x08157DD0, 0x400, b"\x8B\xB0\x88\x01\x00\x00") and
+        has_bytes(image, 0x08157DD0, 0x400, b"\xC7\x81\x88\x01\x00\x00\x01\x00\x00\x00") and
+        has_bytes(image, 0x08157DD0, 0x400, b"\xC7\x81\x88\x01\x00\x00\x00\x00\x00\x00")
+    ) else None
+    targets.append(
+        TargetReport(
+            "action_mode.defensive_state",
+            status_from([defensive_state_branch is not None]),
+            defensive_state_branch,
+            "Windows creature-update parser maps update mask 0x20000 bit 0x400 to client flag +0x184",
+            [
+                "Linux creature-update branch tests update mask 0x20000",
+                "incoming activity bit 0x400 maps to client player +0x188",
+                "branch writes DWORD 1/0 for Defensive Casting on/off feedback",
             ],
         )
     )

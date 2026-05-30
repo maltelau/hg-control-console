@@ -97,6 +97,7 @@ constexpr uint32_t kCurrentClientPlayerResolver = 0x08076A9Cu;
 constexpr uint32_t kServerObjectByIdResolver = 0x082AA024u;
 constexpr uint32_t kSetActionMode = 0x08315B2Cu;
 constexpr uint32_t kGetActionMode = 0x08305538u;
+constexpr uint32_t kToggleModeInput = 0x081365CCu;
 constexpr uint32_t kPlayerNameBuilder = 0x08138B68u;
 constexpr uint32_t kNwnStringDestroy = 0x085A61DCu;
 constexpr uint32_t kCurrentPlayerGlobalAddress = 0x0862EF18u;
@@ -120,8 +121,7 @@ constexpr int kActionModeDefensiveCast = 10;
 constexpr uint32_t kInvalidObjectId = 0x7F000000u;
 constexpr uint32_t kInvalidObjectIdAlt = 0xFFFFFFFFu;
 constexpr uint32_t kCurrentPlayerPositionOffset = 0x30u;
-constexpr uint32_t kCreatureDefensiveCastingModeOffset = 0x4AEu;
-constexpr uint32_t kCreatureCurrentCombatModeOffset = 0x4AFu;
+constexpr uint32_t kClientDefensiveCastingStateOffset = 0x188u;
 constexpr uint32_t kObjectAsCreatureVtableOffset = 0x38u;
 
 constexpr int kLogError = 0;
@@ -2022,6 +2022,129 @@ bool RefreshCharacterIdentity(int32_t* out_error) {
   return err == kErrSuccess;
 }
 
+bool IsLikelyClientPlayer(uint32_t player_object) {
+  return player_object != 0 && ResolveCreatureFromPlayerObject(player_object) != 0;
+}
+
+bool ReadClientDefensiveCastingModeFlag(uint32_t client_player, int32_t* out_active) {
+  if (out_active == nullptr) {
+    return false;
+  }
+  *out_active = 0;
+
+  if (!IsLikelyClientPlayer(client_player)) {
+    return false;
+  }
+
+  uint32_t value = 0;
+  if (!SafeReadValue(
+          static_cast<uintptr_t>(client_player) + kClientDefensiveCastingStateOffset,
+          &value)) {
+    return false;
+  }
+  if (value > 1u) {
+    return false;
+  }
+
+  *out_active = static_cast<int32_t>(value);
+  return true;
+}
+
+bool EnsureCurrentClientPlayerOnMain(uint32_t* out_player_object, int32_t* out_error) {
+  if (out_player_object == nullptr) {
+    if (out_error != nullptr) {
+      *out_error = kErrInvalidParameter;
+    }
+    return false;
+  }
+  *out_player_object = 0;
+
+  uint32_t player_object = static_cast<uint32_t>(AtomicGet(&g_state.player_object));
+  if (!IsLikelyClientPlayer(player_object)) {
+    int32_t identity_error = kErrSuccess;
+    RefreshCharacterIdentity(&identity_error);
+    player_object = static_cast<uint32_t>(AtomicGet(&g_state.player_object));
+  }
+  if (!IsLikelyClientPlayer(player_object)) {
+    player_object = ResolveCurrentClientPlayer();
+    if (IsLikelyClientPlayer(player_object)) {
+      AtomicSet(&g_state.player_object, static_cast<int32_t>(player_object));
+      const uint32_t creature = ResolveCreatureFromPlayerObject(player_object);
+      if (creature != 0) {
+        AtomicSet(&g_state.player_creature, static_cast<int32_t>(creature));
+      }
+    }
+  }
+  if (!IsLikelyClientPlayer(player_object)) {
+    if (out_error != nullptr) {
+      *out_error = kErrNotFound;
+    }
+    return false;
+  }
+
+  *out_player_object = player_object;
+  if (out_error != nullptr) {
+    *out_error = kErrSuccess;
+  }
+  return true;
+}
+
+bool TriggerToggleModeInputOnMain(int32_t mode, uint32_t target_object_id, int32_t* out_active, int32_t* out_error) {
+  if (out_active != nullptr) {
+    *out_active = -1;
+  }
+
+  uint32_t player_object = 0;
+  int32_t last_error = kErrSuccess;
+  if (!EnsureCurrentClientPlayerOnMain(&player_object, &last_error)) {
+    if (out_error != nullptr) {
+      *out_error = last_error;
+    }
+    return false;
+  }
+
+  typedef void (*ToggleModeInputFn)(void*, int32_t, uint32_t);
+  const uint32_t resolved_target = target_object_id != 0 ? target_object_id : kInvalidObjectId;
+  int signal_number = 0;
+  uintptr_t instruction_pointer = 0;
+  uintptr_t fault_address = 0;
+  if (!RunWithFaultGuard(
+          [&]() {
+            NwnFunction<ToggleModeInputFn>(kToggleModeInput)(
+                reinterpret_cast<void*>(player_object),
+                mode,
+                resolved_target);
+          },
+          &signal_number,
+          &instruction_pointer,
+          &fault_address)) {
+    if (out_error != nullptr) {
+      *out_error = kErrInvalidData;
+    }
+    LogMessage(
+        kLogError,
+        "toggle mode input failed mode=%d player=0x%08X target=0x%08X signal=%d ip=0x%08lX fault=0x%08lX",
+        mode,
+        player_object,
+        resolved_target,
+        signal_number,
+        static_cast<unsigned long>(instruction_pointer),
+        static_cast<unsigned long>(fault_address));
+    return false;
+  }
+
+  if (out_error != nullptr) {
+    *out_error = kErrSuccess;
+  }
+  LogMessage(
+      kLogInfo,
+      "toggle mode input dispatched mode=%d player=0x%08X target=0x%08X active=unknown",
+      mode,
+      player_object,
+      resolved_target);
+  return true;
+}
+
 bool SetActionModeOnMain(int32_t mode, int32_t enabled, int32_t* out_active, int32_t* out_error) {
   if (out_active != nullptr) {
     *out_active = 0;
@@ -2031,6 +2154,15 @@ bool SetActionModeOnMain(int32_t mode, int32_t enabled, int32_t* out_active, int
       *out_error = kErrInvalidParameter;
     }
     return false;
+  }
+  if (mode == kActionModeDefensiveCast) {
+    if (!enabled) {
+      if (out_error != nullptr) {
+        *out_error = kErrNotSupported;
+      }
+      return false;
+    }
+    return TriggerToggleModeInputOnMain(mode, kInvalidObjectId, out_active, out_error);
   }
   uint32_t game_object = 0;
   uint32_t creature = ResolveCurrentServerCreature(&game_object);
@@ -2042,8 +2174,37 @@ bool SetActionModeOnMain(int32_t mode, int32_t enabled, int32_t* out_active, int
   }
   typedef void (*SetModeFn)(void*, uint8_t, int32_t);
   typedef int32_t (*GetModeFn)(void*, uint8_t);
-  NwnFunction<SetModeFn>(kSetActionMode)(reinterpret_cast<void*>(creature), static_cast<uint8_t>(mode), enabled ? 1 : 0);
-  const int32_t active = NwnFunction<GetModeFn>(kGetActionMode)(reinterpret_cast<void*>(creature), static_cast<uint8_t>(mode));
+  int32_t active = 0;
+  int signal_number = 0;
+  uintptr_t instruction_pointer = 0;
+  uintptr_t fault_address = 0;
+  if (!RunWithFaultGuard(
+          [&]() {
+            NwnFunction<SetModeFn>(kSetActionMode)(
+                reinterpret_cast<void*>(creature),
+                static_cast<uint8_t>(mode),
+                enabled ? 1 : 0);
+            active = NwnFunction<GetModeFn>(kGetActionMode)(
+                reinterpret_cast<void*>(creature),
+                static_cast<uint8_t>(mode));
+          },
+          &signal_number,
+          &instruction_pointer,
+          &fault_address)) {
+    if (out_error != nullptr) {
+      *out_error = kErrInvalidData;
+    }
+    LogMessage(
+        kLogError,
+        "set action mode failed mode=%d enabled=%d creature=0x%08X signal=%d ip=0x%08lX fault=0x%08lX",
+        mode,
+        enabled ? 1 : 0,
+        creature,
+        signal_number,
+        static_cast<unsigned long>(instruction_pointer),
+        static_cast<unsigned long>(fault_address));
+    return false;
+  }
   if (out_active != nullptr) {
     *out_active = active;
   }
@@ -2566,6 +2727,13 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
   pending_done = g_pending.done;
   pending_kind = static_cast<int32_t>(g_pending.kind);
   pthread_mutex_unlock(&g_pending_mutex);
+  const uint32_t snapshot_player_object = static_cast<uint32_t>(AtomicGet(&g_state.player_object));
+  const uint32_t snapshot_player_creature = static_cast<uint32_t>(AtomicGet(&g_state.player_creature));
+  int32_t client_defensive_casting = -1;
+  const int32_t client_defensive_casting_error =
+      ReadClientDefensiveCastingModeFlag(snapshot_player_object, &client_defensive_casting)
+          ? kErrSuccess
+          : kErrInvalidData;
 
   snprintf(
       out,
@@ -2582,7 +2750,7 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
       "chat: trace=%d queued=%d nextWrite=%d latestSeq=%d lastMode=%d lastRc=%d lastErr=%d\n"
       "overlay: hook=%d count=%d draws=%d err=%d\n"
       "movement: walkToWaypoint=0x%08X noWalkBypass=%d positionValid=%d position=(%.3f, %.3f, %.3f)\n"
-      "actionMode: set=0x%08X get=0x%08X clientPlayer=0x%08X serverCreature=0x%08X\n"
+      "actionMode: toggle=0x%08X set=0x%08X get=0x%08X clientPlayer=0x%08X serverCreature=0x%08X defensiveOffset=0x%X defensiveState=%d defensiveErr=%d\n"
       "identity: player=0x%08X creature=0x%08X name=%s refreshes=%d err=%d\n"
       "last: vk=0x%08X rc=%d err=%d\n",
       reason != nullptr ? reason : "snapshot",
@@ -2647,12 +2815,16 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
       static_cast<double>(x),
       static_cast<double>(y),
       static_cast<double>(z),
+      kToggleModeInput,
       kSetActionMode,
       kGetActionMode,
-      g_state.player_object,
-      g_state.player_creature,
-      g_state.player_object,
-      g_state.player_creature,
+      snapshot_player_object,
+      snapshot_player_creature,
+      kClientDefensiveCastingStateOffset,
+      client_defensive_casting,
+      client_defensive_casting_error,
+      snapshot_player_object,
+      snapshot_player_creature,
       name[0] != '\0' ? name : "<unknown>",
       g_state.identity_refresh_count,
       g_state.identity_error,
