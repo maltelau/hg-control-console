@@ -3,7 +3,7 @@ name = "hg-control-console"
 version = "0.1.0"
 description = "HG Control Console (HGCC) is a control and automation toolkit for Neverwinter Nights Diamond clients running on the Higher Ground server"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = []
 
 
