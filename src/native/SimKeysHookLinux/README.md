@@ -44,12 +44,16 @@ overlay drawing is disabled by default because some X11/GL stacks terminate the
 client on overlay setup. Set `SIMKEYS_LINUX_ENABLE_OVERLAY=1` before launching
 to opt in to Linux overlay rendering.
 
-Quickbar and chat inline trace detours are disabled by default. The socket
-command path can discover the quickbar panel on demand and falls back to SDL
-key events when direct internal quickbar calls are unsafe. Set
-`SIMKEYS_LINUX_ENABLE_QUICKBAR_TRACE=1` or `SIMKEYS_LINUX_ENABLE_CHAT_TRACE=1`
-only when passive quickbar/chat capture is needed on a client stack known to
-tolerate those detours.
+The chat inline trace detour is enabled by default so HGCC modes can read
+combat/server lines without extra launch flags. Set
+`SIMKEYS_LINUX_ENABLE_CHAT_TRACE=0` or `SIMKEYS_LINUX_DISABLE_CHAT_TRACE=1`
+only when temporarily diagnosing a client stack.
+
+Quickbar inline trace detours remain disabled by default. The socket command
+path can discover the quickbar panel on demand and falls back to SDL key events
+when direct internal quickbar calls are unsafe. Set
+`SIMKEYS_LINUX_ENABLE_QUICKBAR_TRACE=1` only when passive quickbar capture is
+needed on a client stack known to tolerate those detours.
 
 The hook exposes the same HGCC opcode protocol as the Windows DLL, but over
 `simkeys_<pid>.sock` in `SIMKEYS_LINUX_SOCKET_DIR`, `$XDG_RUNTIME_DIR/hgcc`, or

@@ -589,6 +589,17 @@ bool EnvFlagEnabled(const char* name) {
       value[0] != 'N';
 }
 
+bool EnvFlagExplicitlyDisabled(const char* name) {
+  const char* value = getenv(name);
+  return value != nullptr &&
+      value[0] != '\0' &&
+      (value[0] == '0' ||
+       value[0] == 'f' ||
+       value[0] == 'F' ||
+       value[0] == 'n' ||
+       value[0] == 'N');
+}
+
 const struct sigaction* PreviousFaultAction(int signal_number) {
   switch (signal_number) {
     case SIGBUS:
@@ -1491,7 +1502,8 @@ void InstallHooks() {
       AtomicSet(&g_state.quickbar_slot_trace_installed, 1);
     }
   }
-  if (EnvFlagEnabled("SIMKEYS_LINUX_ENABLE_CHAT_TRACE") &&
+  if (!EnvFlagExplicitlyDisabled("SIMKEYS_LINUX_ENABLE_CHAT_TRACE") &&
+      !EnvFlagEnabled("SIMKEYS_LINUX_DISABLE_CHAT_TRACE") &&
       AtomicGet(&g_state.chat_trace_installed) == 0 &&
       InstallInlineHook(kChatWindowLog, 9, reinterpret_cast<void*>(ChatWindowLogTraceThunk), g_chat_log_original, &g_chat_log_gateway)) {
     AtomicSet(&g_state.chat_trace_installed, 1);
