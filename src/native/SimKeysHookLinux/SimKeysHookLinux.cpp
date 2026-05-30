@@ -1089,7 +1089,16 @@ bool SafeReadString(const void* nwn_string, char* out, size_t capacity) {
   if (!RangeIsMapped(text_ptr, copy_length, false)) {
     return false;
   }
-  memcpy(out, reinterpret_cast<const void*>(text_ptr), copy_length);
+
+  int signal_number = 0;
+  if (!RunWithFaultGuard(
+          [&]() {
+            memcpy(out, reinterpret_cast<const void*>(text_ptr), copy_length);
+          },
+          &signal_number)) {
+    out[0] = '\0';
+    return false;
+  }
   out[copy_length] = '\0';
   return true;
 }
@@ -1378,12 +1387,15 @@ extern "C" void ChatWindowLogTraceThunk();
 __attribute__((naked)) void QuickbarExecTraceThunk() {
   asm volatile(
       "pusha\n"
-      "movl 40(%%esp), %%eax\n"
-      "movl 36(%%esp), %%edx\n"
+      "movl %%esp, %%esi\n"
+      "andl $-16, %%esp\n"
+      "subl $8, %%esp\n"
+      "movl 40(%%esi), %%eax\n"
+      "movl 36(%%esi), %%edx\n"
       "pushl %%eax\n"
       "pushl %%edx\n"
       "call SimKeysLinuxCaptureQuickbarExec\n"
-      "addl $8, %%esp\n"
+      "movl %%esi, %%esp\n"
       "popa\n"
       "jmp *%0\n"
       :
@@ -1393,10 +1405,13 @@ __attribute__((naked)) void QuickbarExecTraceThunk() {
 __attribute__((naked)) void QuickbarSlotTraceThunk() {
   asm volatile(
       "pusha\n"
-      "movl 36(%%esp), %%eax\n"
+      "movl %%esp, %%esi\n"
+      "andl $-16, %%esp\n"
+      "subl $12, %%esp\n"
+      "movl 36(%%esi), %%eax\n"
       "pushl %%eax\n"
       "call SimKeysLinuxCaptureQuickbarSlotDispatch\n"
-      "addl $4, %%esp\n"
+      "movl %%esi, %%esp\n"
       "popa\n"
       "jmp *%0\n"
       :
@@ -1406,12 +1421,15 @@ __attribute__((naked)) void QuickbarSlotTraceThunk() {
 __attribute__((naked)) void ChatWindowLogTraceThunk() {
   asm volatile(
       "pusha\n"
-      "movl 40(%%esp), %%eax\n"
-      "movl 36(%%esp), %%edx\n"
+      "movl %%esp, %%esi\n"
+      "andl $-16, %%esp\n"
+      "subl $8, %%esp\n"
+      "movl 40(%%esi), %%eax\n"
+      "movl 36(%%esi), %%edx\n"
       "pushl %%eax\n"
       "pushl %%edx\n"
       "call SimKeysLinuxCaptureChatWindowLog\n"
-      "addl $8, %%esp\n"
+      "movl %%esi, %%esp\n"
       "popa\n"
       "jmp *%0\n"
       :

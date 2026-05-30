@@ -12,6 +12,7 @@ read -r -a CXX_CMD <<< "${CXX:-g++}"
   -std=gnu++11 \
   -O2 \
   -fPIC \
+  -mstackrealign \
   -shared \
   -fno-exceptions \
   -fno-rtti \

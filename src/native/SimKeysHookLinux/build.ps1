@@ -58,6 +58,7 @@ if (-not $BundleOut) {
   -std=gnu++11 `
   -O2 `
   -fPIC `
+  -mstackrealign `
   -shared `
   -fno-exceptions `
   -fno-rtti `
