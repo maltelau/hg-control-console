@@ -223,6 +223,7 @@ OP_QUERY=3000; OP_SLOT=3001; OP_VK=3002; OP_SETLOG=3003; OP_REPLAY=3004; OP_SNAP
 QUERY_STRUCT_LEGACY = struct.Struct("<" + ("I" * 24) + ("i" * 10) + "I" + ("i" * 2) + ("I" * 4) + f"{CHAR_NAME_CAPACITY}s")
 QUERY_STRUCT = struct.Struct("<" + ("I" * 24) + ("i" * 10) + "I" + ("i" * 2) + ("I" * 4) + "ifff" + f"{CHAR_NAME_CAPACITY}s")
 QUERY_STRUCT_WITH_CREATURE = struct.Struct("<" + ("I" * 24) + ("i" * 10) + ("I" * 2) + ("i" * 2) + ("I" * 4) + "ifff" + f"{CHAR_NAME_CAPACITY}s")
+QUERY_STRUCT_WITH_HEALTH = struct.Struct(QUERY_STRUCT_WITH_CREATURE.format + "iiIIi")
 OVERLAY_TEXT_HEADER = struct.Struct("<iiiiiIi")
 OVERLAY_RESPONSE = struct.Struct("<iiii")
 MOVE_TO_LOCATION_REQUEST = struct.Struct("<fffiIi")
@@ -301,7 +302,14 @@ def format_quickbar_slots(mask):
 
 def query_state(p):
     _, data = p.xfer(OP_QUERY)
-    if len(data) == QUERY_STRUCT_WITH_CREATURE.size:
+    health = (0, 0, 0, 0, 0)
+    health_available = False
+    if len(data) == QUERY_STRUCT_WITH_HEALTH.size:
+        unpacked = QUERY_STRUCT_WITH_HEALTH.unpack(data)
+        health = unpacked[-5:]
+        unpacked = unpacked[:-5]
+        health_available = True
+    elif len(data) == QUERY_STRUCT_WITH_CREATURE.size:
         unpacked = QUERY_STRUCT_WITH_CREATURE.unpack(data)
     elif len(data) == QUERY_STRUCT.size:
         unpacked = QUERY_STRUCT.unpack(data)
@@ -311,7 +319,7 @@ def query_state(p):
         unpacked = legacy[:35] + (0,) + legacy[35:-1] + (0, 0.0, 0.0, 0.0, legacy[-1])
     else:
         raise RuntimeError(
-            f"unexpected query payload size: got {len(data)}, expected {QUERY_STRUCT_WITH_CREATURE.size}"
+            f"unexpected query payload size: got {len(data)}, expected {QUERY_STRUCT_WITH_HEALTH.size}"
         )
     (module_base, hook_proc, hwnd, current_proc, original_proc, main_tid, installed,
      expected_wndproc, expected_pre_dispatch, expected_dispatch_thunk, expected_dispatch_slot0,
@@ -322,6 +330,7 @@ def query_state(p):
      quickbar_item_mask_low, quickbar_item_mask_high, quickbar_equipped_mask_low, quickbar_equipped_mask_high,
      position_valid, position_x, position_y, position_z,
      character_name_raw) = unpacked
+    (player_current_hp, player_max_hp, player_current_hp_address, player_max_hp_address, player_hp_error) = health
     quickbar_item_mask = (int(quickbar_item_mask_high) << 32) | int(quickbar_item_mask_low)
     quickbar_equipped_mask = (int(quickbar_equipped_mask_high) << 32) | int(quickbar_equipped_mask_low)
     return {
@@ -375,6 +384,12 @@ def query_state(p):
         "position_y": float(position_y),
         "position_z": float(position_z),
         "position": (float(position_x), float(position_y), float(position_z)) if position_valid else None,
+        "player_current_hp": int(player_current_hp),
+        "player_max_hp": int(player_max_hp),
+        "player_current_hp_address": player_current_hp_address,
+        "player_max_hp_address": player_max_hp_address,
+        "player_hp_error": int(player_hp_error),
+        "player_hp_available": health_available,
         "character_name": decode_cstring(character_name_raw),
     }
 
@@ -389,6 +404,7 @@ def cmd_query(p):
     position = result.get("position")
     position_text = f" pos=({position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f})" if position else " pos=<unknown>"
     print(f"identity: player={phex(result['player_object'])} creature={phex(result['player_creature'])} name={result['character_name'] or '<unknown>'} refreshes={result['identity_refresh_count']} err={result['identity_error']}{position_text}")
+    print(f"health: available={int(result['player_hp_available'])} current={result['player_current_hp']} max={result['player_max_hp']} currentAddr={phex(result['player_current_hp_address'])} maxAddr={phex(result['player_max_hp_address'])} err={result['player_hp_error']}")
     print(f"last: vk={phex(result['last_vk'])} rc={result['last_rc']} err={result['last_error']}")
     print()
     cmd_snapshot(p)

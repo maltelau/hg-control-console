@@ -103,6 +103,8 @@ constexpr uint32_t kWalkNoWalkBlock = 0x0807E84Au;
 constexpr uint32_t kWalkNoWalkBypassTarget = 0x0807E878u;
 constexpr uint32_t kCurrentGuiResolver = 0x08077008u;
 constexpr uint32_t kCurrentClientPlayerResolver = 0x08076A9Cu;
+constexpr uint32_t kQuickbarItemResolver = 0x08076B4Cu;
+constexpr uint32_t kItemEquippedOwnerResolver = 0x0819BF34u;
 constexpr uint32_t kServerObjectByIdResolver = 0x082AA024u;
 constexpr uint32_t kSetActionMode = 0x08315B2Cu;
 constexpr uint32_t kGetActionMode = 0x08305538u;
@@ -132,6 +134,8 @@ constexpr uint32_t kInvalidObjectIdAlt = 0xFFFFFFFFu;
 constexpr uint32_t kCurrentPlayerPositionOffset = 0x30u;
 constexpr uint32_t kClientDefensiveCastingStateOffset = 0x188u;
 constexpr uint32_t kObjectAsCreatureVtableOffset = 0x38u;
+constexpr uint32_t kCreatureCurrentHitPointsOffset = 0x48u;
+constexpr uint32_t kCreatureMaxHitPointsOffset = 0x4Au;
 
 constexpr int kLogError = 0;
 constexpr int kLogInfo = 1;
@@ -229,6 +233,11 @@ struct QueryResponse {
   float position_y;
   float position_z;
   char character_name[kCharacterNameCapacity];
+  int32_t player_current_hp;
+  int32_t player_max_hp;
+  uint32_t player_current_hp_address;
+  uint32_t player_max_hp_address;
+  int32_t player_hp_error;
 };
 
 struct TriggerResponse {
@@ -1360,6 +1369,12 @@ bool IsValidObjectId(uint32_t object_id) {
       object_id < 0x80000000u;
 }
 
+bool IsValidQuickbarItemId(uint32_t object_id) {
+  return object_id != 0 &&
+      object_id != kInvalidObjectId &&
+      object_id != kInvalidObjectIdAlt;
+}
+
 uint32_t ReadAppHolderPointer() {
   return SafeReadPointer32(kAppGlobalSlotAddress);
 }
@@ -1489,15 +1504,125 @@ bool TryDeriveQuickbarPanelFromSlot(uint32_t slot_ptr, uint32_t* out_panel, int3
   return false;
 }
 
+void SetQuickbarMaskBit(uint32_t* low, uint32_t* high, int bit_index) {
+  if (low == nullptr || high == nullptr || bit_index < 0) {
+    return;
+  }
+
+  if (bit_index < 32) {
+    *low |= (1u << bit_index);
+  } else if (bit_index < kQuickbarTotalSlots) {
+    *high |= (1u << (bit_index - 32));
+  }
+}
+
+void StoreQuickbarItemMasks(uint32_t item_low, uint32_t item_high, uint32_t equipped_low, uint32_t equipped_high) {
+  AtomicSet(&g_state.quickbar_item_mask_low, static_cast<int32_t>(item_low));
+  AtomicSet(&g_state.quickbar_item_mask_high, static_cast<int32_t>(item_high));
+  AtomicSet(&g_state.quickbar_equipped_mask_low, static_cast<int32_t>(equipped_low));
+  AtomicSet(&g_state.quickbar_equipped_mask_high, static_cast<int32_t>(equipped_high));
+}
+
+uint32_t ResolveCurrentClientPlayer();
+
+bool ResolveQuickbarItemById(uint32_t app_object, uint32_t object_id, uint32_t* out_object) {
+  if (out_object != nullptr) {
+    *out_object = 0;
+  }
+  if (app_object == 0 || !IsValidQuickbarItemId(object_id)) {
+    return false;
+  }
+
+  typedef void* (*ItemByIdFn)(void*, uint32_t);
+  void* object = nullptr;
+  int signal_number = 0;
+  if (!RunWithFaultGuard(
+          [&]() {
+            object = NwnFunction<ItemByIdFn>(kQuickbarItemResolver)(
+                reinterpret_cast<void*>(app_object),
+                object_id);
+          },
+          &signal_number)) {
+    LogMessage(
+        kLogDebug,
+        "quickbar item resolver faulted signal=%d appObject=0x%08X objectId=0x%08X",
+        signal_number,
+        app_object,
+        object_id);
+    return false;
+  }
+
+  if (object == nullptr) {
+    return false;
+  }
+  if (out_object != nullptr) {
+    *out_object = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(object));
+  }
+  return true;
+}
+
+bool ResolveItemEquippedOwner(uint32_t item_object, uint32_t* out_owner) {
+  if (out_owner != nullptr) {
+    *out_owner = 0;
+  }
+  if (item_object == 0) {
+    return false;
+  }
+
+  typedef void* (*ItemEquippedOwnerFn)(void*);
+  void* owner = nullptr;
+  int signal_number = 0;
+  if (!RunWithFaultGuard(
+          [&]() {
+            owner = NwnFunction<ItemEquippedOwnerFn>(kItemEquippedOwnerResolver)(
+                reinterpret_cast<void*>(item_object));
+          },
+          &signal_number)) {
+    LogMessage(
+        kLogDebug,
+        "item equipped owner resolver faulted signal=%d itemObject=0x%08X",
+        signal_number,
+        item_object);
+    return false;
+  }
+
+  if (owner == nullptr) {
+    return false;
+  }
+  if (out_owner != nullptr) {
+    *out_owner = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(owner));
+  }
+  return true;
+}
+
+bool ItemIsEquippedByCurrentPlayer(uint32_t item_object, uint32_t current_player, uint32_t current_player_object_id) {
+  uint32_t owner = 0;
+  if (!ResolveItemEquippedOwner(item_object, &owner)) {
+    return false;
+  }
+  if (owner == current_player) {
+    return true;
+  }
+  return IsValidObjectId(current_player_object_id) &&
+      SafeReadPointer32(static_cast<uintptr_t>(owner) + 4u) == current_player_object_id;
+}
+
 void UpdateQuickbarItemMasks() {
   uint32_t item_low = 0;
   uint32_t item_high = 0;
+  uint32_t equipped_low = 0;
+  uint32_t equipped_high = 0;
   const uint32_t panel = static_cast<uint32_t>(AtomicGet(&g_state.quickbar_this));
   if (!IsQuickbarPanel(panel)) {
-    AtomicSet(&g_state.quickbar_item_mask_low, 0);
-    AtomicSet(&g_state.quickbar_item_mask_high, 0);
-    AtomicSet(&g_state.quickbar_equipped_mask_low, 0);
-    AtomicSet(&g_state.quickbar_equipped_mask_high, 0);
+    StoreQuickbarItemMasks(0, 0, 0, 0);
+    return;
+  }
+
+  const uint32_t app_object = ReadAppObjectPointer();
+  const uint32_t current_player_object_id = ReadCurrentPlayerObjectId();
+  const uint32_t current_player = ResolveCurrentClientPlayer();
+  if (app_object == 0 || current_player == 0) {
+    StoreQuickbarItemMasks(0, 0, 0, 0);
     return;
   }
 
@@ -1511,22 +1636,40 @@ void UpdateQuickbarItemMasks() {
       continue;
     }
     const uint32_t primary_item_id = SafeReadPointer32(slot + kQuickbarSlotPrimaryItemOffset);
-    if (!IsValidObjectId(primary_item_id)) {
+    if (!IsValidQuickbarItemId(primary_item_id)) {
       continue;
     }
-    if (index < 32) {
-      item_low |= (1u << index);
-    } else {
-      item_high |= (1u << (index - 32));
+
+    uint32_t primary_item = 0;
+    if (!ResolveQuickbarItemById(app_object, primary_item_id, &primary_item)) {
+      continue;
     }
+    SetQuickbarMaskBit(&item_low, &item_high, index);
+
+    if (!ItemIsEquippedByCurrentPlayer(primary_item, current_player, current_player_object_id)) {
+      continue;
+    }
+
+    const uint32_t secondary_item_id = SafeReadPointer32(slot + kQuickbarSlotSecondaryItemOffset);
+    if (IsValidQuickbarItemId(secondary_item_id)) {
+      uint32_t secondary_item = 0;
+      if (!ResolveQuickbarItemById(app_object, secondary_item_id, &secondary_item) ||
+          !ItemIsEquippedByCurrentPlayer(secondary_item, current_player, current_player_object_id)) {
+        continue;
+      }
+    }
+
+    SetQuickbarMaskBit(&equipped_low, &equipped_high, index);
   }
 
-  AtomicSet(&g_state.quickbar_item_mask_low, static_cast<int32_t>(item_low));
-  AtomicSet(&g_state.quickbar_item_mask_high, static_cast<int32_t>(item_high));
-  // Equipped weapon detection needs more live validation on Linux.  Expose a
-  // conservative zero equipped mask instead of guessing wrong ownership state.
-  AtomicSet(&g_state.quickbar_equipped_mask_low, 0);
-  AtomicSet(&g_state.quickbar_equipped_mask_high, 0);
+  StoreQuickbarItemMasks(item_low, item_high, equipped_low, equipped_high);
+  LogMessage(
+      kLogDebug,
+      "quickbar item masks refreshed item=0x%08X%08X equipped=0x%08X%08X",
+      item_high,
+      item_low,
+      equipped_high,
+      equipped_low);
 }
 
 void QueueChatLine(const char* text) {
@@ -2191,6 +2334,66 @@ bool BuildCreatureName(uint32_t creature, char* out, size_t capacity) {
     snprintf(out, capacity, "%s", last);
   }
   return out[0] != '\0';
+}
+
+bool ReadCreatureHitPoints(
+    uint32_t creature,
+    int32_t* out_current_hp,
+    int32_t* out_max_hp,
+    uint32_t* out_current_hp_address,
+    uint32_t* out_max_hp_address,
+    int32_t* out_error) {
+  if (out_current_hp != nullptr) {
+    *out_current_hp = 0;
+  }
+  if (out_max_hp != nullptr) {
+    *out_max_hp = 0;
+  }
+  if (out_current_hp_address != nullptr) {
+    *out_current_hp_address = 0;
+  }
+  if (out_max_hp_address != nullptr) {
+    *out_max_hp_address = 0;
+  }
+  if (out_error != nullptr) {
+    *out_error = kErrNotFound;
+  }
+
+  if (creature == 0 ||
+      !RangeIsMapped(creature, kCreatureMaxHitPointsOffset + sizeof(int16_t), false)) {
+    return false;
+  }
+
+  int16_t current_hp = 0;
+  int16_t max_hp = 0;
+  const uintptr_t current_hp_address =
+      static_cast<uintptr_t>(creature) + kCreatureCurrentHitPointsOffset;
+  const uintptr_t max_hp_address =
+      static_cast<uintptr_t>(creature) + kCreatureMaxHitPointsOffset;
+  if (!SafeReadValue(current_hp_address, &current_hp) ||
+      !SafeReadValue(max_hp_address, &max_hp)) {
+    if (out_error != nullptr) {
+      *out_error = kErrInvalidData;
+    }
+    return false;
+  }
+
+  if (out_current_hp != nullptr) {
+    *out_current_hp = static_cast<int32_t>(current_hp);
+  }
+  if (out_max_hp != nullptr) {
+    *out_max_hp = static_cast<int32_t>(max_hp);
+  }
+  if (out_current_hp_address != nullptr) {
+    *out_current_hp_address = static_cast<uint32_t>(current_hp_address);
+  }
+  if (out_max_hp_address != nullptr) {
+    *out_max_hp_address = static_cast<uint32_t>(max_hp_address);
+  }
+  if (out_error != nullptr) {
+    *out_error = kErrSuccess;
+  }
+  return true;
 }
 
 bool RefreshCharacterIdentity(int32_t* out_error) {
@@ -3474,6 +3677,18 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
       ReadClientDefensiveCastingModeFlag(snapshot_player_object, &client_defensive_casting)
           ? kErrSuccess
           : kErrInvalidData;
+  int32_t current_hp = 0;
+  int32_t max_hp = 0;
+  uint32_t current_hp_address = 0;
+  uint32_t max_hp_address = 0;
+  int32_t hp_error = kErrNotFound;
+  ReadCreatureHitPoints(
+      snapshot_player_creature,
+      &current_hp,
+      &max_hp,
+      &current_hp_address,
+      &max_hp_address,
+      &hp_error);
 
   snprintf(
       out,
@@ -3491,6 +3706,7 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
       "overlay: hook=%d count=%d draws=%d err=%d\n"
       "movement: walkToWaypoint=0x%08X noWalkBypass=%d positionValid=%d position=(%.3f, %.3f, %.3f)\n"
       "actionMode: toggle=0x%08X set=0x%08X get=0x%08X clientPlayer=0x%08X serverCreature=0x%08X defensiveOffset=0x%X defensiveState=%d defensiveErr=%d\n"
+      "health: current=%d max=%d currentAddr=0x%08X maxAddr=0x%08X err=%d\n"
       "identity: player=0x%08X creature=0x%08X name=%s refreshes=%d err=%d\n"
       "last: vk=0x%08X rc=%d err=%d\n",
       reason != nullptr ? reason : "snapshot",
@@ -3563,6 +3779,11 @@ void FillSnapshotText(const char* reason, char* out, size_t capacity) {
       kClientDefensiveCastingStateOffset,
       client_defensive_casting,
       client_defensive_casting_error,
+      current_hp,
+      max_hp,
+      current_hp_address,
+      max_hp_address,
+      hp_error,
       snapshot_player_object,
       snapshot_player_creature,
       name[0] != '\0' ? name : "<unknown>",
@@ -3756,6 +3977,14 @@ void FillQueryResponse(QueryResponse* response) {
   response->log_level = static_cast<int32_t>(AtomicGet(&g_state.log_level));
   response->player_object = static_cast<uint32_t>(AtomicGet(&g_state.player_object));
   response->player_creature = static_cast<uint32_t>(AtomicGet(&g_state.player_creature));
+  response->player_hp_error = kErrNotFound;
+  ReadCreatureHitPoints(
+      response->player_creature,
+      &response->player_current_hp,
+      &response->player_max_hp,
+      &response->player_current_hp_address,
+      &response->player_max_hp_address,
+      &response->player_hp_error);
   response->identity_refresh_count = static_cast<int32_t>(AtomicGet(&g_state.identity_refresh_count));
   response->identity_error = static_cast<int32_t>(AtomicGet(&g_state.identity_error));
   response->quickbar_item_mask_low = static_cast<uint32_t>(AtomicGet(&g_state.quickbar_item_mask_low));

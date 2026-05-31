@@ -42,6 +42,8 @@ kLegacyClientDefensiveCastingModeOffset = 0x184
 kLegacyHpOwnerOffset = 0x2B8
 kLegacyCurrentHpOffset = 0x4C
 kLegacyMaxHpProbeOffsets = (2, 4, 6, 8, 0xA, 0xC, 0xE, 0x10)
+kLinuxCreatureCurrentHpOffset = 0x48
+kLinuxCreatureMaxHpOffset = 0x4A
 kLinuxClientDefensiveCastingModeOffset = 0x188
 
 WEAPON_SLOT_NONE = "-"
@@ -1065,6 +1067,8 @@ class AutoDrinkScript(ClientScriptBase):
         self.hp_address = 0
         self.hp_owner_address = 0
         self.max_hp_address = 0
+        self.hp_source = ""
+        self.max_hp_source = ""
         self.max_hp_observed = 0
         self.drink_generation = 0
         self.drinking = False
@@ -1079,6 +1083,8 @@ class AutoDrinkScript(ClientScriptBase):
         self.hp_address = 0
         self.hp_owner_address = 0
         self.max_hp_address = 0
+        self.hp_source = ""
+        self.max_hp_source = ""
         self.max_hp_observed = 0
         self.drink_generation = 0
         self.drinking = False
@@ -1119,8 +1125,45 @@ class AutoDrinkScript(ClientScriptBase):
         self.hp_address = 0
         self.hp_owner_address = 0
         self.max_hp_address = 0
+        self.hp_source = ""
+        self.max_hp_source = ""
+
+    def _resolve_linux_hp_address(self):
+        try:
+            state = self.host.query_state()
+        except Exception:
+            state = {}
+        creature = int(state.get("player_creature", 0) or 0)
+        player_object = int(state.get("player_object", 0) or 0)
+        if creature == 0:
+            raise RuntimeError("AutoDrink Linux player creature pointer is not available from the Linux hook yet")
+
+        hp_address = creature + kLinuxCreatureCurrentHpOffset
+        max_hp_address = creature + kLinuxCreatureMaxHpOffset
+        if creature != self.hp_owner_address or hp_address != self.hp_address or max_hp_address != self.max_hp_address:
+            previous_address = self.hp_address
+            module_base = int(state.get("module_base", 0) or (self.client.query or {}).get("module_base", 0) or 0)
+            self.hp_owner_address = creature
+            self.hp_address = hp_address
+            self.max_hp_address = max_hp_address
+            self.hp_source = f"linux-creature+0x{kLinuxCreatureCurrentHpOffset:X}"
+            self.max_hp_source = f"linux-creature+0x{kLinuxCreatureCurrentHpOffset:X}/+0x{kLinuxCreatureMaxHpOffset:X}"
+            if previous_address != hp_address:
+                self.host.emit(
+                    "info",
+                    (
+                        f"{self.client.display_name}: hp path resolved module=0x{module_base:08X} "
+                        f"source=linux-client-state clientPlayer=0x{player_object:08X} "
+                        f"creature=0x{creature:08X} currentHp=0x{hp_address:08X} maxHp=0x{max_hp_address:08X}"
+                    ),
+                    script_id=self.script_id,
+                )
+        return self.hp_address
 
     def _resolve_hp_address(self):
+        if not IS_WINDOWS:
+            return self._resolve_linux_hp_address()
+
         module_base = int((self.client.query or {}).get("module_base", 0)) or kLegacyImageBase
         pointer1_address = module_base + kLegacyHpPointerOffset
         pointer2_holder = self._read_u32(pointer1_address)
@@ -1136,6 +1179,8 @@ class AutoDrinkScript(ClientScriptBase):
             self.hp_owner_address = hp_owner
             self.hp_address = hp_address
             self.max_hp_address = 0
+            self.hp_source = f"legacy+0x{kLegacyCurrentHpOffset:X}"
+            self.max_hp_source = ""
             if previous_address != hp_address:
                 self.host.emit(
                     "info",
@@ -1303,7 +1348,60 @@ class AutoDrinkScript(ClientScriptBase):
             self.max_hp_address = best_address
         return best_value
 
+    def _read_linux_hook_health_snapshot(self):
+        try:
+            state = self.host.query_state()
+        except Exception as exc:
+            raise RuntimeError(f"Linux hook HP query failed: {exc}") from exc
+
+        if not bool(state.get("player_hp_available", False)):
+            return None
+
+        creature = int(state.get("player_creature", 0) or 0)
+        player_object = int(state.get("player_object", 0) or 0)
+        hp_error = int(state.get("player_hp_error", 0) or 0)
+        current_hp = int(state.get("player_current_hp", 0) or 0)
+        max_hp = int(state.get("player_max_hp", 0) or 0)
+        hp_address = int(state.get("player_current_hp_address", 0) or 0)
+        max_hp_address = int(state.get("player_max_hp_address", 0) or 0)
+        if hp_error != 0 or creature == 0 or hp_address == 0 or max_hp_address == 0:
+            raise RuntimeError(
+                f"Linux hook HP read failed err={hp_error} creature=0x{creature:08X} currentHp=0x{hp_address:08X}"
+            )
+        if not self._plausible_health_value(current_hp):
+            raise RuntimeError(f"current HP at 0x{hp_address:08X} was implausible ({current_hp})")
+        if not self._plausible_max_health_value(max_hp, current_hp):
+            raise RuntimeError(f"max HP at 0x{max_hp_address:08X} was implausible ({max_hp}) for current HP {current_hp}")
+
+        if creature != self.hp_owner_address or hp_address != self.hp_address or max_hp_address != self.max_hp_address:
+            previous_address = self.hp_address
+            module_base = int(state.get("module_base", 0) or (self.client.query or {}).get("module_base", 0) or 0)
+            self.hp_owner_address = creature
+            self.hp_address = hp_address
+            self.max_hp_address = max_hp_address
+            self.hp_source = "linux-hook"
+            self.max_hp_source = f"linux-hook+0x{kLinuxCreatureCurrentHpOffset:X}/+0x{kLinuxCreatureMaxHpOffset:X}"
+            if previous_address != hp_address:
+                self.host.emit(
+                    "info",
+                    (
+                        f"{self.client.display_name}: hp path resolved module=0x{module_base:08X} "
+                        f"source=linux-hook clientPlayer=0x{player_object:08X} creature=0x{creature:08X} "
+                        f"currentHp=0x{hp_address:08X} maxHp=0x{max_hp_address:08X}"
+                    ),
+                    script_id=self.script_id,
+                )
+
+        self.max_hp_observed = max(self.max_hp_observed, current_hp, max_hp)
+        percent = (float(current_hp) * 100.0 / float(max_hp)) if max_hp > 0 else 100.0
+        return current_hp, max_hp, percent, self.max_hp_source or "linux-hook"
+
     def _read_health_snapshot(self):
+        if not IS_WINDOWS:
+            hook_snapshot = self._read_linux_hook_health_snapshot()
+            if hook_snapshot is not None:
+                return hook_snapshot
+
         last_error = None
         for attempt in range(3):
             try:
@@ -1319,11 +1417,13 @@ class AutoDrinkScript(ClientScriptBase):
                         candidate = self._read_u16(self.max_hp_address)
                         if self._plausible_max_health_value(candidate, current_hp):
                             max_hp = candidate
-                            source = f"probe+0x{self.max_hp_address - self.hp_address:X}"
+                            source = self.max_hp_source or f"probe+0x{self.max_hp_address - self.hp_address:X}"
                         else:
                             self.max_hp_address = 0
+                            self.max_hp_source = ""
                     except Exception:
                         self.max_hp_address = 0
+                        self.max_hp_source = ""
 
                 if max_hp == 0:
                     candidate = self._guess_max_hp(current_hp)
