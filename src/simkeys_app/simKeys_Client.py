@@ -25,6 +25,7 @@ else:
     k32 = None
 INVALID_HANDLE_VALUE = C.c_void_p(-1).value
 CHAR_NAME_CAPACITY = 128
+NWN_TEXT_ENCODING = "cp1252"
 ERROR_SUCCESS = 0
 ERROR_FILE_NOT_FOUND = 2
 ERROR_PATH_NOT_FOUND = 3
@@ -278,8 +279,20 @@ def overlay_position_value(value):
         return OVERLAY_POSITIONS[compact]
     raise ValueError(f"unknown overlay position: {value}")
 
+def decode_nwn_text(data):
+    raw = bytes(data or b"")
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(NWN_TEXT_ENCODING, errors="replace")
+
+def encode_nwn_text(text):
+    return str(text or "").encode(NWN_TEXT_ENCODING, errors="replace")
+
 def decode_cstring(b):
-    return b.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+    return decode_nwn_text(b.split(b"\x00", 1)[0])
 
 def quickbar_bit(page, slot):
     return int(page) * 12 + (int(slot) - 1)
@@ -411,7 +424,7 @@ def cmd_query(p):
 
 def cmd_snapshot(p):
     _, data = p.xfer(OP_SNAPSHOT)
-    text = data.decode("utf-8", errors="replace")
+    text = decode_nwn_text(data)
     print(text.rstrip())
 
 def cmd_replay(p):
@@ -440,7 +453,7 @@ def cmd_setlog(p, level):
     print("log level set to", actual)
 
 def chat_send(p, text, mode=2):
-    payload = text.encode("utf-8", errors="replace")
+    payload = encode_nwn_text(text)
     _, data = p.xfer(OP_CHAT_SEND, struct.pack("ii", mode, len(payload)) + payload)
     success, actual_mode, rc, err = struct.unpack("iiii", data)
     return {
@@ -510,7 +523,7 @@ def chat_poll(p, after=0, max_lines=20):
         offset += 8
         if text_len < 0 or offset + text_len > len(data):
             raise RuntimeError("chat-poll payload ended before line text")
-        text = data[offset:offset + text_len].decode("utf-8", errors="replace")
+        text = decode_nwn_text(data[offset:offset + text_len])
         offset += text_len
         lines.append({
             "seq": seq,
