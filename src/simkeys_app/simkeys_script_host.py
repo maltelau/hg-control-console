@@ -1230,9 +1230,7 @@ class AutoDrinkScript(ClientScriptBase):
     def _poll_health_once(self):
         if not self.enabled or self.drinking:
             return
-        if self.host.is_shifter_recovery_active():
-            self.lock_saved_for_recovery = False
-            self.set_status("Paused: shifter form recovery")
+        if self._actions_blocked_by_shifter():
             return
 
         current_hp, max_hp, percent, source = self._read_health_snapshot()
@@ -1240,6 +1238,8 @@ class AutoDrinkScript(ClientScriptBase):
         self.set_status(f"HP {current_hp}/{max_hp} ({percent:.1f}%) [{source}]")
         if percent > threshold_percent:
             self.lock_saved_for_recovery = False
+            return
+        if self._actions_blocked_by_shifter():
             return
 
         slot = int(self.config.get("slot", 2))
@@ -1253,6 +1253,8 @@ class AutoDrinkScript(ClientScriptBase):
                 self.lock_saved_for_recovery = False
                 self.host.emit("error", f"{self.client.display_name}: !lock opponent failed: {exc}", script_id=self.script_id)
 
+        if self._actions_blocked_by_shifter():
+            return
         result = self.host.trigger_slot(slot, page=page)
         self._begin_drink_cooldown()
 
@@ -1271,6 +1273,13 @@ class AutoDrinkScript(ClientScriptBase):
             self.host.send_console(
                 f"HGCC autodrink {current_hp}/{max_hp} ({percent:.1f}%) -> {trigger_name} rc={result['rc']} err={result['err']}"
             )
+
+    def _actions_blocked_by_shifter(self) -> bool:
+        if self.host.is_shifter_recovery_active():
+            self.lock_saved_for_recovery = False
+            self.set_status("Paused: shifter form recovery")
+            return True
+        return False
 
     def _close_process_handle(self):
         handle = self.process_handle
@@ -1459,6 +1468,10 @@ class AutoDrinkScript(ClientScriptBase):
                 return
             self.drinking = False
             if bool(self.config.get("resume_attack", True)):
+                if self.host.is_shifter_recovery_active():
+                    self.set_status("Paused: shifter form recovery")
+                    self.host.set_auto_attack_pause(False)
+                    return
                 try:
                     self.host.send_chat("!action attack locked", 2)
                 except Exception as exc:
@@ -2349,7 +2362,7 @@ class AutoAAScript(ClientScriptBase):
         if self.shifter_lock_sent or not bool(self.config.get("shifter_lock_target", True)):
             return
         try:
-            result = self.host.send_chat("!lock opponent", 2)
+            result = self._send_shifter_chat("!lock opponent", 2)
             if not result.get("success"):
                 self.host.emit(
                     "error",
@@ -2374,7 +2387,7 @@ class AutoAAScript(ClientScriptBase):
             return
         self.shifter_resume_pending = False
         try:
-            result = self.host.send_chat("!action attack locked", 2)
+            result = self._send_shifter_chat("!action attack locked", 2)
             if not result.get("success"):
                 self.host.emit(
                     "error",
@@ -2390,6 +2403,18 @@ class AutoAAScript(ClientScriptBase):
                 f"{self.host.client.display_name}: {self._mode_label()} !action attack locked failed: {exc}",
                 script_id=self.script_id,
             )
+
+    def _send_shifter_chat(self, text: str, mode: int = 2):
+        try:
+            return self.host.send_chat(text, mode, bypass_shifter_lock=True)
+        except TypeError:
+            return self.host.send_chat(text, mode)
+
+    def _trigger_shifter_slot(self, slot: int, page: int = 0):
+        try:
+            return self.host.trigger_slot(slot, page=page, bypass_shifter_lock=True)
+        except TypeError:
+            return self.host.trigger_slot(slot, page=page)
 
     def _begin_shifter_sequence(self, binding: WeaponBinding, target_name: str, reason: str, unarm: bool = False) -> bool:
         if self.shifter_swap_stage:
@@ -2413,7 +2438,7 @@ class AutoAAScript(ClientScriptBase):
             return self._trigger_shifter_weapon_slot("already unshifted")
 
         try:
-            result = self.host.send_chat("!cancel poly", 2)
+            result = self._send_shifter_chat("!cancel poly", 2)
         except Exception as exc:
             self.shifter_last_error = str(exc)
             self._reset_shifter_runtime(clear_observed=False)
@@ -2466,7 +2491,7 @@ class AutoAAScript(ClientScriptBase):
             return False
 
         try:
-            result = self.host.trigger_slot(binding.slot, page=binding.page)
+            result = self._trigger_shifter_slot(binding.slot, page=binding.page)
         except Exception as exc:
             self.shifter_last_error = str(exc)
             self.set_status(f"{target_name}: shifter swap failed")
@@ -2557,7 +2582,7 @@ class AutoAAScript(ClientScriptBase):
             return False
 
         try:
-            result = self.host.trigger_slot(self.shifter_shift_slot, page=self.shifter_shift_page)
+            result = self._trigger_shifter_slot(self.shifter_shift_slot, page=self.shifter_shift_page)
         except Exception as exc:
             self.shifter_last_error = str(exc)
             result = {"success": False, "rc": 0, "aux_rc": 0, "path": 0, "err": str(exc)}
@@ -8624,6 +8649,19 @@ class ClientScriptHost:
             self.shifter_recovery_reason = ""
             return False
 
+    def _shifter_action_block_reason(self) -> str:
+        with self.lock:
+            if time.monotonic() < float(self.shifter_recovery_until or 0.0):
+                return self.shifter_recovery_reason or "shifter form recovery"
+            self.shifter_recovery_until = 0.0
+            self.shifter_recovery_reason = ""
+            return ""
+
+    def _raise_if_shifter_action_blocked(self):
+        reason = self._shifter_action_block_reason()
+        if reason:
+            raise RuntimeError(f"shifter action queue is locked: {reason}")
+
     def set_auto_attack_pause(self, active: bool, reason: str = "", ttl_seconds: float = 5.0):
         with self.lock:
             if active:
@@ -8751,7 +8789,9 @@ class ClientScriptHost:
         with self.lock:
             return sorted(self.scripts.keys())
 
-    def trigger_slot(self, slot: int, page: int = 0):
+    def trigger_slot(self, slot: int, page: int = 0, bypass_shifter_lock: bool = False):
+        if not bypass_shifter_lock:
+            self._raise_if_shifter_action_blocked()
         return runtime.trigger_slot(self.client, slot, page=page)
 
     def query_state(self) -> dict:
@@ -8766,14 +8806,18 @@ class ClientScriptHost:
             return f"Ctrl+F{slot}"
         return f"page {page} slot {slot}"
 
-    def send_console(self, text: str):
+    def send_console(self, text: str, bypass_shifter_lock: bool = False):
         if self._chat_is_locked_out():
             raise RuntimeError("chat is locked out because the client is at the password prompt")
+        if not bypass_shifter_lock:
+            self._raise_if_shifter_action_blocked()
         return runtime.send_chat(self.client, f"!echo {text}", 2)
 
-    def send_chat(self, text: str, mode: int = 2):
+    def send_chat(self, text: str, mode: int = 2, bypass_shifter_lock: bool = False):
         if self._chat_is_locked_out():
             raise RuntimeError("chat is locked out because the client is at the password prompt")
+        if not bypass_shifter_lock:
+            self._raise_if_shifter_action_blocked()
         return runtime.send_chat(self.client, text, mode)
 
     def move_to_location(self, x: float, y: float, z: float, bypass_no_walk: bool = False):

@@ -63,15 +63,22 @@ class FakeHost:
     def format_slot(self, page, slot):
         return f"F{slot}" if page == 0 else f"P{page}F{slot}"
 
-    def send_chat(self, text, mode=2):
+    def _raise_if_shifter_action_blocked(self, bypass_shifter_lock=False):
+        if not bypass_shifter_lock and self.is_shifter_recovery_active():
+            raise RuntimeError(f"shifter action queue is locked: {self.recovery_reason}")
+
+    def send_chat(self, text, mode=2, bypass_shifter_lock=False):
+        self._raise_if_shifter_action_blocked(bypass_shifter_lock=bypass_shifter_lock)
         self.chats.append(text)
         return {"success": 1, "rc": 0, "err": 0}
 
-    def send_console(self, text):
+    def send_console(self, text, bypass_shifter_lock=False):
+        self._raise_if_shifter_action_blocked(bypass_shifter_lock=bypass_shifter_lock)
         self.chats.append(f"!echo {text}")
         return {"success": 1, "rc": 0, "err": 0}
 
-    def trigger_slot(self, slot, page=0):
+    def trigger_slot(self, slot, page=0, bypass_shifter_lock=False):
+        self._raise_if_shifter_action_blocked(bypass_shifter_lock=bypass_shifter_lock)
         self.slots.append((page, slot))
         if slot == 2:
             self.mask = 1 << 1
@@ -640,6 +647,74 @@ class ChatEventTests(unittest.TestCase):
         drink._poll_health_once()
         self.assertEqual(host.slots, [])
         self.assertIn("Paused", drink.status_text)
+
+    def test_autodrink_does_not_queue_heal_if_shifter_starts_during_hp_poll(self):
+        host = FakeHost()
+        drink = AutoDrinkScript(
+            host.client,
+            {"slot": 2, "echo_console": False, "lock_target": True, "threshold_percent": 80.0},
+            host,
+        )
+        drink.enabled = True
+
+        def snapshot():
+            host.set_shifter_recovery_active(True, "shifter swap started", ttl_seconds=5.0)
+            return (1, 100, 1.0, "test")
+
+        drink._read_health_snapshot = snapshot
+        drink._poll_health_once()
+
+        self.assertEqual(host.chats, [])
+        self.assertEqual(host.slots, [])
+        self.assertIn("Paused", drink.status_text)
+
+    def test_autodrink_does_not_queue_potion_if_shifter_starts_after_lock(self):
+        class LockRaceHost(FakeHost):
+            def send_chat(self, text, mode=2, bypass_shifter_lock=False):
+                result = super().send_chat(text, mode=mode, bypass_shifter_lock=bypass_shifter_lock)
+                if text == "!lock opponent":
+                    self.set_shifter_recovery_active(True, "shifter swap started", ttl_seconds=5.0)
+                return result
+
+        host = LockRaceHost()
+        drink = AutoDrinkScript(
+            host.client,
+            {"slot": 2, "echo_console": False, "lock_target": True, "threshold_percent": 80.0},
+            host,
+        )
+        drink.enabled = True
+        drink._read_health_snapshot = lambda: (1, 100, 1.0, "test")
+
+        drink._poll_health_once()
+
+        self.assertEqual(host.chats, ["!lock opponent"])
+        self.assertEqual(host.slots, [])
+        self.assertIn("Paused", drink.status_text)
+
+    def test_autodrink_resume_attack_skips_while_shifter_sequence_active(self):
+        host = FakeHost()
+        drink = AutoDrinkScript(
+            host.client,
+            {
+                "slot": 2,
+                "echo_console": False,
+                "lock_target": False,
+                "resume_attack": True,
+                "threshold_percent": 80.0,
+                "cooldown_seconds": 0.05,
+            },
+            host,
+        )
+        drink.enabled = True
+        drink._read_health_snapshot = lambda: (1, 100, 1.0, "test")
+
+        drink._poll_health_once()
+        host.set_shifter_recovery_active(True, "shifter swap started", ttl_seconds=5.0)
+        time.sleep(0.15)
+
+        self.assertEqual(host.slots, [(0, 2)])
+        self.assertNotIn("!action attack locked", host.chats)
+        self.assertFalse(host.is_auto_attack_paused())
 
     def test_coordinate_follow_only_wants_relevant_chat_events(self):
         host = FakeHost()
