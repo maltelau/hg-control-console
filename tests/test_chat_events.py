@@ -1108,6 +1108,7 @@ class ChatEventTests(unittest.TestCase):
         host = FakeHost()
         host.set_auto_attack_pause(True, "AutoDrink cooldown", ttl_seconds=1.0)
         attack = AutoAttackScript(host.client, {"cooldown_seconds": 0.1}, host)
+        attack.last_combat_at = time.monotonic()
 
         attack.on_start()
         deadline = time.monotonic() + 0.5

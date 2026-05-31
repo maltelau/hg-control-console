@@ -1,7 +1,13 @@
 import time
 import unittest
 
-from src.simkeys_app.simkeys_script_host import ChatLineEvent, AutoActionScript, AutoCombatModeScript, parse_chat_line_event
+from src.simkeys_app.simkeys_script_host import (
+    ChatLineEvent,
+    AutoActionScript,
+    AutoAttackScript,
+    AutoCombatModeScript,
+    parse_chat_line_event,
+)
 
 
 class FakeClient:
@@ -46,6 +52,21 @@ class FakeHost:
 
     def is_shifter_recovery_active(self):
         return self.recovery_active
+
+    def is_auto_attack_paused(self):
+        return False
+
+
+class StopAfterFirstWait:
+    def __init__(self):
+        self.wait_calls = []
+
+    def is_set(self):
+        return False
+
+    def wait(self, timeout):
+        self.wait_calls.append(float(timeout))
+        return True
 
 
 class TestAutoActionCombat(unittest.TestCase):
@@ -92,6 +113,68 @@ class TestAutoActionCombat(unittest.TestCase):
         self.assertEqual(self.script._combat_window_seconds(), 12.5)
         self.assertTrue(self.script._combat_is_recent(now=112.4))
         self.assertFalse(self.script._combat_is_recent(now=112.6))
+
+
+class TestAutoAttackCombat(unittest.TestCase):
+    def setUp(self):
+        self.host = FakeHost()
+        self.script = AutoAttackScript(self.host.client, {"cooldown_seconds": 1.0}, self.host)
+        self.script.enabled = True
+
+    def test_combat_tracking_matches_auto_action(self):
+        self.assertEqual(self.script.last_combat_at, 0.0)
+
+        event = parse_chat_line_event(1, "PlayerCharacter attacks Aboleth")
+        self.script.on_chat_event(event)
+
+        self.assertGreater(self.script.last_combat_at, 0.0)
+
+        self.script.last_combat_at = 0.0
+        event = parse_chat_line_event(2, "PlayerCharacter attacks FriendlyNPC")
+        self.script.on_chat_event(event)
+        self.assertEqual(self.script.last_combat_at, 0.0)
+
+        event = parse_chat_line_event(3, "OtherPlayer attacks Aboleth")
+        self.script.on_chat_event(event)
+        self.assertEqual(self.script.last_combat_at, 0.0)
+
+    def test_damage_tracking_matches_auto_action(self):
+        event = parse_chat_line_event(1, "PlayerCharacter damages Aboleth: 10 (10 physical)")
+        self.script.on_chat_event(event)
+
+        self.assertGreater(self.script.last_combat_at, 0.0)
+
+    def test_combat_window_uses_six_second_minimum(self):
+        self.script.last_combat_at = 100.0
+
+        self.assertEqual(self.script._combat_window_seconds(), 6.0)
+        self.assertTrue(self.script._combat_is_recent(now=105.9))
+        self.assertFalse(self.script._combat_is_recent(now=106.1))
+
+    def test_combat_window_extends_for_longer_cooldowns(self):
+        self.script.config["cooldown_seconds"] = 12.5
+        self.script.last_combat_at = 100.0
+
+        self.assertEqual(self.script._combat_window_seconds(), 12.5)
+        self.assertTrue(self.script._combat_is_recent(now=112.4))
+        self.assertFalse(self.script._combat_is_recent(now=112.6))
+
+    def test_loop_waits_without_sending_until_combat_is_recent(self):
+        self.script.loop_stop = StopAfterFirstWait()
+
+        self.script._run_loop()
+
+        self.assertEqual(self.host.chats, [])
+        self.assertEqual(self.script.status_text, "Waiting for combat")
+
+    def test_loop_sends_when_combat_is_recent(self):
+        self.script.last_combat_at = time.monotonic()
+        self.script.loop_stop = StopAfterFirstWait()
+
+        self.script._run_loop()
+
+        self.assertEqual(self.host.chats, [(AutoAttackScript.COMMAND, 2)])
+        self.assertEqual(self.script.status_text, "Running: Auto Attack")
 
 
 class TestAutoCombatMode(unittest.TestCase):

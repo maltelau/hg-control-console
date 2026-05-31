@@ -6152,6 +6152,7 @@ class AutoActionScript(ClientScriptBase):
 
 class AutoAttackScript(ClientScriptBase):
     script_id = "auto_attack"
+    COMBAT_WINDOW_SECONDS = 6.0
     COMMAND = "!action attack lead:opponent"
 
     def __init__(self, client, config: Dict[str, object], host):
@@ -6160,9 +6161,31 @@ class AutoAttackScript(ClientScriptBase):
         self.loop_thread = None
         self.loop_stop = threading.Event()
         self.last_error_key = ""
+        self.last_combat_at = 0.0
+        self.db = hgx_data.load_default_database()
 
     def needs_chat_feed(self) -> bool:
-        return False
+        return True
+
+    def chat_event_types(self) -> Tuple[str, ...]:
+        return ("attack", "damage")
+
+    def on_chat_event(self, event: ChatLineEvent):
+        if not self.enabled:
+            return
+
+        attacker = ""
+        defender = ""
+        if event.attack:
+            attacker = event.attack.attacker
+            defender = event.attack.defender
+        elif event.damage:
+            attacker = event.damage.attacker
+            defender = event.damage.defender
+
+        if attacker and self._actor_is_self(attacker):
+            if self.db.lookup(defender) is not None:
+                self.last_combat_at = time.monotonic()
 
     def on_start(self):
         super().on_start()
@@ -6175,10 +6198,13 @@ class AutoAttackScript(ClientScriptBase):
             daemon=True,
         )
         self.loop_thread.start()
-        self.set_status(f"Attacking every {self._cooldown_seconds():.1f}s")
+        self.set_status("Waiting for combat")
         self.host.emit(
             "info",
-            f"{self.host.client.display_name}: Auto Attack started ({self.COMMAND} every {self._cooldown_seconds():.1f}s)",
+            (
+                f"{self.host.client.display_name}: Auto Attack started "
+                f"({self.COMMAND} every {self._cooldown_seconds():.1f}s while in combat)"
+            ),
             script_id=self.script_id,
         )
 
@@ -6193,6 +6219,13 @@ class AutoAttackScript(ClientScriptBase):
 
     def _run_loop(self):
         while not self.loop_stop.is_set():
+            now = time.monotonic()
+            if not self._combat_is_recent(now):
+                self.set_status("Waiting for combat")
+                if self.loop_stop.wait(0.50):
+                    break
+                continue
+
             if self.host.is_shifter_recovery_active():
                 self.set_status("Paused: shifter form recovery")
                 if self.loop_stop.wait(min(self._cooldown_seconds(), 0.50)):
@@ -6207,6 +6240,7 @@ class AutoAttackScript(ClientScriptBase):
                 if self.loop_stop.wait(min(self._cooldown_seconds(), 0.50)):
                     break
                 continue
+            self.set_status("Running: Auto Attack")
             try:
                 result = self.host.send_chat(self.COMMAND, 2)
                 if result["success"]:
@@ -6244,6 +6278,15 @@ class AutoAttackScript(ClientScriptBase):
 
     def _cooldown_seconds(self) -> float:
         return max(float(self.config.get("cooldown_seconds", 3.0)), 0.1)
+
+    def _combat_window_seconds(self) -> float:
+        return max(self.COMBAT_WINDOW_SECONDS, self._cooldown_seconds())
+
+    def _combat_is_recent(self, now: Optional[float] = None) -> bool:
+        if self.last_combat_at <= 0:
+            return False
+        current = time.monotonic() if now is None else float(now)
+        return current - self.last_combat_at <= self._combat_window_seconds()
 
 
 class AutoFollowScript(ClientScriptBase):
@@ -9184,15 +9227,16 @@ class ScriptManager:
         auto_attack = ScriptDefinition(
             script_id="auto_attack",
             name="Auto Attack",
-            description="Repeatedly issue `!action attack lead:opponent`, matching the old HGXLE autoAttack.py behavior.",
+            description="Issue `!action attack lead:opponent` on a cooldown while recent combat is observed.",
             fields=[
                 ScriptField("cooldown_seconds", "Cooldown", "float", 3.0, minimum=0.1, maximum=30.0, step=0.1, width=6),
             ],
             factory=AutoAttackScript,
             details=(
-                "Auto Attack makes every client running it continually try to attack the target of the character assigned "
-                "as lead. Use `Set Selected as Lead` on the chosen lead character first, then start Auto Attack on the "
-                "followers; the lead itself should not have Auto Attack started."
+                "Auto Attack makes every client running it try to attack the target of the character assigned as lead "
+                "while recent outgoing attack or damage lines show active combat with a known characters.d target. "
+                "Use `Set Selected as Lead` on the chosen lead character first, then start Auto Attack on the followers; "
+                "the lead itself should not have Auto Attack started."
             ),
         )
         self.registry[auto_attack.script_id] = auto_attack
