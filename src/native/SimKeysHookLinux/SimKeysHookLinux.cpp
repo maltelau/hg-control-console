@@ -98,7 +98,7 @@ constexpr uint32_t kQuickbarSlotDispatch = 0x080CAA50u;
 constexpr uint32_t kQuickbarPanelVtable = 0x0862F900u;
 constexpr uint32_t kChatSend = 0x08265054u;
 constexpr uint32_t kChatWindowLog = 0x080B89F0u;
-constexpr uint32_t kWalkToWaypoint = 0x0807E41Cu;
+constexpr uint32_t kWalkToWaypoint = 0x08077260u;
 constexpr uint32_t kWalkNoWalkBlock = 0x0807E84Au;
 constexpr uint32_t kWalkNoWalkBypassTarget = 0x0807E878u;
 constexpr uint32_t kCurrentGuiResolver = 0x08077008u;
@@ -2143,16 +2143,38 @@ int32_t CallMoveToLocationDirect(float x, float y, float z, int32_t client_side,
     }
     temporary_bypass = true;
   }
-  typedef int32_t (*WalkFn)(void*, float, float, float, int32_t, uint32_t, int32_t);
+  typedef int32_t (*WalkFn)(void*, float, float, float, int32_t, uint32_t);
   const uint32_t resolved_action = action_object_id != 0 ? action_object_id : kInvalidObjectId;
-  const int32_t rc = NwnFunction<WalkFn>(kWalkToWaypoint)(
-      reinterpret_cast<void*>(app_object),
-      x,
-      y,
-      z,
-      client_side ? 1 : 0,
-      resolved_action,
-      0);
+  int32_t rc = 0;
+  int signal_number = 0;
+  if (!RunWithFaultGuard(
+          [&]() {
+            rc = NwnFunction<WalkFn>(kWalkToWaypoint)(
+                reinterpret_cast<void*>(app_object),
+                x,
+                y,
+                z,
+                client_side ? 1 : 0,
+                resolved_action);
+          },
+          &signal_number)) {
+    errno = EFAULT;
+    LogMessage(
+        kLogError,
+        "move-to-location faulted signal=%d wrapper=0x%08X appObject=0x%08X xyz=(%.3f, %.3f, %.3f) clientSide=%d action=0x%08X",
+        signal_number,
+        kWalkToWaypoint,
+        app_object,
+        static_cast<double>(x),
+        static_cast<double>(y),
+        static_cast<double>(z),
+        client_side ? 1 : 0,
+        resolved_action);
+    if (temporary_bypass) {
+      SetWalkBypassEnabled(false);
+    }
+    return 0;
+  }
   if (temporary_bypass) {
     SetWalkBypassEnabled(false);
   }
